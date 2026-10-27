@@ -1,0 +1,2875 @@
+--[[--
+    Text Animator
+    A native DaVinci Resolve / Fusion Fuse.
+
+    Animates text per character, word or line entirely inside a Fuse.
+    No Text+ node chaining and no macro is used.
+
+    Target: DaVinci Resolve 21.1.1 (Fusion 21), macOS / Windows / Linux.
+    Version: 1.1.11
+    License: MIT (see LICENSE in the project folder)
+
+    IMPORTANT
+    ---------
+    This file contains two parts:
+
+      1. TextAnimatorEngine - a pure Lua engine. It performs UTF-8 decoding,
+         layout, segmentation, ordering, timing and easing. It is deliberately
+         free of Fusion calls so it can be unit tested outside of Resolve.
+         It is exposed as the global TextAnimatorEngine.
+
+      2. The Fuse wrapper (Create / NotifyChanged / Process) which uses the
+         documented Fusion shape and text APIs to rasterise the result.
+
+    The engine is tested outside Resolve. Rendering has to be verified in
+    Resolve because the development machine used for this build cannot run
+    Fusion headlessly or automate the Resolve GUI. See docs/TestReport.md
+    for exactly what was verified and what was not.
+--]]--
+
+FuRegisterClass("TextAnimator", CT_Tool, {
+    REGS_Name = "Text Animator",
+    REGS_Category = "Fuses\\Text",
+    REGS_OpIconString = "TxA",
+    REGS_OpDescription = "Per-character, word and line text animation with native Fuse rendering",
+    REGS_HelpTopic = "Text Animator - Fuses\\Text",
+    REG_Version = 121,
+    REG_TimeVariant = true,
+    REG_NoBlendCtrls = true,
+    REG_NoObjMatCtrls = true,
+    REG_NoMotionBlurCtrls = true,
+    REG_OpNoMask = true,
+    REG_Fuse_NoEdit = false,
+    REG_Fuse_NoReload = false,
+})
+
+--===========================================================================
+-- PART 0 - DIAGNOSTICS
+--
+-- This block must be defined before Create() and before the engine, because
+-- the diagnostics are used while the Fuse file is being loaded and while the
+-- tool is being built.  In Lua a local is only visible after its declaration,
+-- so keeping this block further down the file would make Create() call a nil
+-- global instead of dbg().
+--
+-- Every message is prefixed with "[Text Animator]" so it can be copied out of
+-- the Fusion console.  The same text is mirrored to a log file when Lua's io
+-- library is available in the host.  DEBUG is switched off once the render
+-- path has been verified in Resolve.
+--===========================================================================
+
+local DEBUG = true
+
+local logFilePath = nil
+local logFileHandle = nil
+local function logWrite(msg)
+    if logFilePath == false then return end
+    if not logFilePath then
+        local candidates = {}
+        local home = os.getenv("HOME")
+        if home then
+            candidates[#candidates + 1] =
+                home .. "/Library/Application Support/Fusion/TextAnimator-debug.log"
+        end
+        local tmp = os.getenv("TMPDIR")
+        if tmp then
+            candidates[#candidates + 1] = tmp .. "/TextAnimator-debug.log"
+        end
+        candidates[#candidates + 1] = "/tmp/TextAnimator-debug.log"
+        for i = 1, #candidates do
+            local ok, f = pcall(io.open, candidates[i], "a")
+            if ok and f then
+                logFilePath = candidates[i]
+                logFileHandle = f
+                break
+            end
+        end
+        logFilePath = logFilePath or false
+    end
+    if logFileHandle then
+        pcall(function()
+            logFileHandle:write(os.date("%H:%M:%S ") .. msg .. "\n")
+            logFileHandle:flush()
+        end)
+    end
+end
+
+local function dbg(...)
+    if not DEBUG then return end
+    local parts = {}
+    for i = 1, select("#", ...) do
+        parts[#parts + 1] = tostring((select(i, ...)))
+    end
+    local msg = table.concat(parts, " ")
+    pcall(print, "[Text Animator] " .. msg)
+    logWrite(msg)
+end
+
+--===========================================================================
+-- PART 1 - PURE ENGINE
+--===========================================================================
+
+local E = {}
+TextAnimatorEngine = E
+
+E.VERSION = "1.1.11"
+
+E.MODE_IN_OUT = 0
+E.MODE_IN_ONLY = 1
+E.MODE_OUT_ONLY = 2
+E.MODE_NONE = 3
+
+E.SEQ_CHARACTER = 0
+E.SEQ_WORD = 1
+E.SEQ_LINE = 2
+
+E.ORDER_FORWARD = 0
+E.ORDER_REVERSE = 1
+E.ORDER_CENTER_OUT = 2
+E.ORDER_OUTSIDE_IN = 3
+E.ORDER_RANDOM = 4
+
+E.ALIGN_LEFT = 0
+E.ALIGN_CENTER = 1
+E.ALIGN_RIGHT = 2
+
+E.VALIGN_TOP = 0
+E.VALIGN_MIDDLE = 1
+E.VALIGN_BOTTOM = 2
+
+-- Order must match the ComboControl entries in buildControls() and E.ease().
+E.EASING_NAMES = {
+    "Linear", "Cubic In", "Cubic Out", "Cubic In Out",
+    "Elastic In", "Elastic Out", "Back In", "Back Out",
+    "Bounce Out", "Expo In", "Expo Out", "Sine In Out",
+}
+E.EASE_DEFAULT = 2 -- Cubic Out: the default entrance curve.
+E.EASE_DEFAULT_OUT = 3 -- Cubic In Out: the default exit curve.
+E.EASE_MAX = #E.EASING_NAMES - 1
+
+-- Elastic shape.  More cycles than Back so the two curves read differently:
+-- Back makes one soft overshoot, Elastic keeps wobbling.  The time warp slows
+-- the phase at the start, which keeps the first frames of a 12-frame entrance
+-- from consuming most of the move while still fitting several oscillations in.
+E.ELASTIC_CYCLES = 2.5
+E.ELASTIC_DAMPING = 7
+E.ELASTIC_MIN_CYCLES = 1
+E.ELASTIC_MAX_CYCLES = 4
+E.ELASTIC_MIN_DAMPING = 2
+E.ELASTIC_MAX_DAMPING = 20
+E.ELASTIC_TIME_WARP = 1.8
+
+-- Per-segment entrance/exit rotation is in degrees.  +/-720 allows two full
+-- turns in either direction; the slider's comfortable range is +/-180.
+E.ROTATION_LIMIT = 720
+
+E.DIRECTION_NAMES = {
+    "None", "Up", "Down", "Left", "Right",
+    "Up Left", "Up Right", "Down Left", "Down Right",
+}
+
+-- Entrance displacement vectors point from the final position towards the
+-- place the segment starts.  Exit vectors point in the direction of travel.
+-- Y is positive upwards, matching Fusion's image space.
+E.DIRECTIONS = {
+    [0] = { 0, 0, 0, 0 },
+    [1] = { 0, -1, 0, 1 },     -- Up: enter from below, leave upwards
+    [2] = { 0, 1, 0, -1 },     -- Down
+    [3] = { 1, 0, -1, 0 },     -- Left: enter from the right
+    [4] = { -1, 0, 1, 0 },     -- Right
+    [5] = { 1, -1, -1, 1 },    -- Up Left
+    [6] = { -1, -1, 1, 1 },    -- Up Right
+    [7] = { 1, 1, -1, -1 },    -- Down Left
+    [8] = { -1, 1, 1, -1 },    -- Down Right
+}
+
+function E.clamp(v, lo, hi)
+    if v < lo then return lo end
+    if v > hi then return hi end
+    return v
+end
+
+function E.sanitizeNumber(v, default, lo, hi)
+    v = tonumber(v)
+    if v == nil then return default end
+    if v ~= v then return default end
+    if v == math.huge then return hi end
+    if v == -math.huge then return lo end
+    if v < lo then return lo end
+    if v > hi then return hi end
+    return v
+end
+
+function E.sanitizeInt(v, default, lo, hi)
+    return math.floor(E.sanitizeNumber(v, default, lo, hi) + 0.5)
+end
+
+function E.sanitizeBool(v, default)
+    if v == nil then return default and true or false end
+    if type(v) == "boolean" then return v end
+    local n = tonumber(v)
+    if n == nil then return default and true or false end
+    return n > 0.5
+end
+
+-----------------------------------------------------------------------------
+-- UTF-8
+-----------------------------------------------------------------------------
+
+-- Returns an array of {cp=<codepoint>, start=<byte>, len=<bytes>}.
+-- Invalid sequences become U+FFFD and consume one byte, so arbitrary binary
+-- data cannot abort layout.
+function E.utf8Decode(s)
+    local out = {}
+    local i = 1
+    local n = #s
+    while i <= n do
+        local b = s:byte(i)
+        local cp, len
+        if b < 0x80 then
+            cp, len = b, 1
+        elseif b >= 0xC2 and b <= 0xDF then
+            local b2 = s:byte(i + 1)
+            if b2 and b2 >= 0x80 and b2 <= 0xBF then
+                cp = (b - 0xC0) * 64 + (b2 - 0x80)
+                len = 2
+            else
+                cp, len = 0xFFFD, 1
+            end
+        elseif b >= 0xE0 and b <= 0xEF then
+            local b2, b3 = s:byte(i + 1), s:byte(i + 2)
+            local ok = b2 and b3 and b2 >= 0x80 and b2 <= 0xBF
+                and b3 >= 0x80 and b3 <= 0xBF
+            if ok then
+                if b == 0xE0 and b2 < 0xA0 then ok = false end
+                if b == 0xED and b2 > 0x9F then ok = false end
+            end
+            if ok then
+                cp = (b - 0xE0) * 4096 + (b2 - 0x80) * 64 + (b3 - 0x80)
+                len = 3
+            else
+                cp, len = 0xFFFD, 1
+            end
+        elseif b >= 0xF0 and b <= 0xF4 then
+            local b2, b3, b4 = s:byte(i + 1), s:byte(i + 2), s:byte(i + 3)
+            local ok = b2 and b3 and b4
+                and b2 >= 0x80 and b2 <= 0xBF
+                and b3 >= 0x80 and b3 <= 0xBF
+                and b4 >= 0x80 and b4 <= 0xBF
+            if ok then
+                if b == 0xF0 and b2 < 0x90 then ok = false end
+                if b == 0xF4 and b2 > 0x8F then ok = false end
+            end
+            if ok then
+                cp = (b - 0xF0) * 262144 + (b2 - 0x80) * 4096
+                    + (b3 - 0x80) * 64 + (b4 - 0x80)
+                len = 4
+            else
+                cp, len = 0xFFFD, 1
+            end
+        else
+            cp, len = 0xFFFD, 1
+        end
+        out[#out + 1] = { cp = cp, start = i, len = len }
+        i = i + len
+    end
+    return out
+end
+
+function E.isCombiningCp(cp)
+    return (cp >= 0x0300 and cp <= 0x036F)
+        or (cp >= 0x1AB0 and cp <= 0x1AFF)
+        or (cp >= 0x1DC0 and cp <= 0x1DFF)
+        or (cp >= 0x20D0 and cp <= 0x20FF)
+        or (cp >= 0xFE20 and cp <= 0xFE2F)
+        or (cp >= 0x0483 and cp <= 0x0489)
+        or (cp >= 0x0591 and cp <= 0x05BD)
+        or (cp >= 0x0610 and cp <= 0x061A)
+        or (cp >= 0x064B and cp <= 0x065F)
+        or (cp >= 0x0670 and cp <= 0x0670)
+        or (cp >= 0x06D6 and cp <= 0x06DC)
+        or (cp >= 0x0900 and cp <= 0x0903)
+        or (cp >= 0x093A and cp <= 0x093C)
+        or (cp >= 0x093E and cp <= 0x094F)
+        or (cp >= 0x0E31 and cp <= 0x0E31)
+        or (cp >= 0x0E34 and cp <= 0x0E3A)
+end
+
+function E.clusters(cps)
+    local clusters = {}
+    for i = 1, #cps do
+        local item = cps[i]
+        if E.isCombiningCp(item.cp) and #clusters > 0 then
+            local c = clusters[#clusters]
+            c.cps[#c.cps + 1] = item
+        else
+            clusters[#clusters + 1] = { cps = { item } }
+        end
+    end
+    return clusters
+end
+
+function E.splitLines(text)
+    text = tostring(text or "")
+    local lines = {}
+    local start = 1
+    local i = 1
+    while i <= #text do
+        local b = text:byte(i)
+        if b == 10 or b == 13 then
+            lines[#lines + 1] = text:sub(start, i - 1)
+            if b == 13 and text:byte(i + 1) == 10 then i = i + 1 end
+            start = i + 1
+        end
+        i = i + 1
+    end
+    lines[#lines + 1] = text:sub(start)
+    return lines
+end
+
+function E.isSpaceCp(cp)
+    return cp == 32 or cp == 9 or cp == 0xA0
+        or (cp >= 0x2000 and cp <= 0x200A)
+        or cp == 0x202F or cp == 0x205F or cp == 0x3000
+end
+
+-----------------------------------------------------------------------------
+-- Layout
+-----------------------------------------------------------------------------
+
+-- metrics must provide:
+--   advance(codepoint) -> advance in output pixels
+--   kern(prevCodepoint, codepoint) -> adjustment in output pixels
+--   ascentPx, descentPx, lineGapPx
+-- The supplied metrics are already scaled for the requested font size.
+function E.layout(text, opts, metrics)
+    opts = opts or {}
+    if not metrics then error("metrics are required") end
+    local tracking = opts.trackingPx or 0
+    local lineSpacing = opts.lineSpacing or 1
+    local align = opts.align or E.ALIGN_CENTER
+    local valign = opts.valign or E.VALIGN_MIDDLE
+    local sizePx = opts.sizePx or 32
+
+    local ascent = metrics.ascentPx or (sizePx * 0.8)
+    local descent = metrics.descentPx or (sizePx * 0.2)
+    if ascent < 0 then ascent = -ascent end
+    if descent < 0 then descent = -descent end
+    local leading = metrics.lineGapPx or 0
+    local lineHeight = (ascent + descent + leading) * lineSpacing
+    if lineHeight < 1 then lineHeight = (ascent + descent) end
+    if lineHeight < 1 then lineHeight = sizePx end
+
+    local linesText = E.splitLines(text)
+    local lines = {}
+    local glyphs = {}
+    local maxWidth = 0
+    local clusterSeq = 0
+
+    for li = 1, #linesText do
+        local cps = E.utf8Decode(linesText[li])
+        local clusters = E.clusters(cps)
+        local pen = 0
+        local prevCp = nil
+        local lineGlyphs = {}
+        for ci = 1, #clusters do
+            local cluster = clusters[ci]
+            local kern = 0
+            if prevCp and metrics.kern then
+                kern = tonumber(metrics.kern(prevCp, cluster.cps[1].cp)) or 0
+            end
+            pen = pen + kern
+            clusterSeq = clusterSeq + 1
+            for gi = 1, #cluster.cps do
+                local cp = cluster.cps[gi].cp
+                local adv = 0
+                if metrics.advance then
+                    adv = tonumber(metrics.advance(cp)) or 0
+                end
+                if adv < 0 then adv = 0 end
+                local g = {
+                    cp = cp,
+                    line = li,
+                    cluster = clusterSeq,
+                    clusterInLine = ci,
+                    clusterCount = #clusters,
+                    xPx = pen + adv * 0.5,
+                    advancePx = adv,
+                    isSpace = E.isSpaceCp(cp),
+                    baselinePx = 0,
+                }
+                glyphs[#glyphs + 1] = g
+                lineGlyphs[#lineGlyphs + 1] = g
+                pen = pen + adv
+            end
+            if ci < #clusters then pen = pen + tracking end
+            prevCp = cluster.cps[#cluster.cps].cp
+        end
+        local lineWidth = pen
+        if lineWidth > maxWidth then maxWidth = lineWidth end
+        lines[#lines + 1] = {
+            widthPx = lineWidth,
+            glyphs = lineGlyphs,
+            text = linesText[li],
+            clusterCount = #clusters,
+        }
+    end
+
+    local n = #linesText
+    local blockH = 0
+    if n > 0 then
+        blockH = (n - 1) * lineHeight + ascent + descent
+    end
+    local anchorOff = 0
+    if valign == E.VALIGN_TOP then
+        anchorOff = -blockH / 2
+    elseif valign == E.VALIGN_BOTTOM then
+        anchorOff = blockH / 2
+    end
+    local firstBase = anchorOff + blockH / 2 - ascent
+
+    for li, line in ipairs(lines) do
+        local lineStart = 0
+        if align == E.ALIGN_CENTER then
+            lineStart = -line.widthPx / 2
+        elseif align == E.ALIGN_RIGHT then
+            lineStart = -line.widthPx
+        end
+        for gi = 1, #line.glyphs do
+            local g = line.glyphs[gi]
+            g.xPx = g.xPx + lineStart
+            g.baselinePx = firstBase - (li - 1) * lineHeight
+        end
+    end
+
+    local left, right
+    if align == E.ALIGN_CENTER then
+        left, right = -maxWidth / 2, maxWidth / 2
+    elseif align == E.ALIGN_RIGHT then
+        left, right = -maxWidth, 0
+    else
+        left, right = 0, maxWidth
+    end
+    local top = anchorOff + blockH / 2
+    local bottom = anchorOff - blockH / 2
+
+    return {
+        lines = lines,
+        glyphs = glyphs,
+        widthPx = maxWidth,
+        heightPx = blockH,
+        ascentPx = ascent,
+        descentPx = descent,
+        lineHeightPx = lineHeight,
+        lineCount = n,
+        bounds = { left = left, right = right, bottom = bottom, top = top },
+    }
+end
+
+-----------------------------------------------------------------------------
+-- Segmentation
+-----------------------------------------------------------------------------
+
+-- Returns the horizontal offset for one glyph when per-segment tracking is
+-- active.  Tracking is measured in pixels per gap and is centred on the line,
+-- so a positive value spreads the line outwards from its middle and a negative
+-- value pulls it together, without moving the block anchor.  n is the number of
+-- clusters on the line; a one-cluster line has nothing to spread.
+function E.trackShift(g, trackingPx)
+    local n = g.clusterCount or 0
+    if n <= 1 then return 0 end
+    local idx = (g.clusterInLine or 1) - 1
+    return (trackingPx or 0) * (idx - (n - 1) / 2)
+end
+
+-- Adds a .segment field to non-space glyphs and returns the segment list.
+-- Character mode keeps combining marks with their base glyph.
+-- Word mode groups consecutive non-space clusters on a line.
+-- Line mode makes one segment per line that contains visible glyphs.
+function E.buildSegments(layout, mode)
+    local segments = {}
+    local glyphs = layout.glyphs
+    mode = E.sanitizeInt(mode, E.SEQ_CHARACTER, 0, 2)
+
+    if mode == E.SEQ_CHARACTER then
+        local current = nil
+        local lastCluster = nil
+        for i = 1, #glyphs do
+            local g = glyphs[i]
+            if g.isSpace then
+                current = nil
+            else
+                if current == nil or g.cluster ~= lastCluster then
+                    current = { glyphs = {} }
+                    segments[#segments + 1] = current
+                end
+                current.glyphs[#current.glyphs + 1] = g
+                g.segment = #segments
+            end
+            lastCluster = g.cluster
+        end
+    elseif mode == E.SEQ_WORD then
+        local current = nil
+        local lastLine = nil
+        for i = 1, #glyphs do
+            local g = glyphs[i]
+            if g.line ~= lastLine then current = nil end
+            if g.isSpace then
+                current = nil
+            else
+                if current == nil then
+                    current = { glyphs = {} }
+                    segments[#segments + 1] = current
+                end
+                current.glyphs[#current.glyphs + 1] = g
+                g.segment = #segments
+            end
+            lastLine = g.line
+        end
+    else
+        local byLine = {}
+        for i = 1, #glyphs do
+            local g = glyphs[i]
+            if not g.isSpace then
+                local seg = byLine[g.line]
+                if not seg then
+                    seg = { glyphs = {} }
+                    byLine[g.line] = seg
+                    segments[#segments + 1] = seg
+                end
+                seg.glyphs[#seg.glyphs + 1] = g
+                g.segment = #segments
+            end
+        end
+    end
+    return segments
+end
+
+-----------------------------------------------------------------------------
+-- Ordering
+-----------------------------------------------------------------------------
+
+local function randomSeed(seed)
+    seed = math.floor(seed or 1)
+    if seed <= 0 then seed = 1 end
+    return seed % 2147483647
+end
+
+-- Deterministic LCG (Lehmer / Park-Miller).  Lua 5.1 has no bit operators.
+local function lcgNext(state)
+    state = (state * 48271) % 2147483647
+    if state <= 0 then state = state + 2147483646 end
+    return state, state / 2147483647
+end
+
+-- Returns rank[segmentIndex] = 0..count-1.
+function E.computeRanks(count, order, seed)
+    count = math.floor(tonumber(count) or 0)
+    local ranks = {}
+    if count <= 0 then return ranks end
+    order = E.sanitizeInt(order, E.ORDER_FORWARD, 0, 4)
+
+    local idx = {}
+    for i = 1, count do idx[i] = i end
+
+    if order == E.ORDER_REVERSE then
+        for i = 1, count do ranks[i] = count - i end
+        return ranks
+    elseif order == E.ORDER_FORWARD then
+        for i = 1, count do ranks[i] = i - 1 end
+        return ranks
+    end
+
+    if order == E.ORDER_CENTER_OUT or order == E.ORDER_OUTSIDE_IN then
+        local center = (count + 1) / 2
+        table.sort(idx, function(a, b)
+            local da = math.abs(a - center)
+            local db = math.abs(b - center)
+            if da == db then return a < b end
+            return da < db
+        end)
+        for pos = 1, count do
+            local seg = idx[pos]
+            if order == E.ORDER_CENTER_OUT then
+                ranks[seg] = pos - 1
+            else
+                ranks[seg] = count - pos
+            end
+        end
+        return ranks
+    end
+
+    -- Random: shuffle a copy of the index list.  The result depends only on
+    -- count and seed, never on playback history.
+    local state = randomSeed(seed)
+    for i = count, 2, -1 do
+        local r
+        state, r = lcgNext(state)
+        local j = 1 + math.floor(r * i)
+        if j < 1 then j = 1 end
+        if j > i then j = i end
+        idx[i], idx[j] = idx[j], idx[i]
+    end
+    for pos = 1, count do
+        ranks[idx[pos]] = pos - 1
+    end
+    return ranks
+end
+
+-----------------------------------------------------------------------------
+-- Timing
+-----------------------------------------------------------------------------
+
+function E.computeTiming(p, count)
+    count = math.max(1, math.floor(tonumber(count) or 1))
+    local inDuration = p.inDuration
+    local inStagger = p.inStagger
+    local outDuration = p.outDuration
+    local outStagger = p.outStagger
+
+    if p.fitIn then
+        local total = math.max(0, p.inTotal)
+        inDuration = math.min(inDuration, total)
+        if count > 1 then
+            inStagger = math.max(0, (total - inDuration) / (count - 1))
+        else
+            inStagger = 0
+        end
+    end
+    if p.fitOut then
+        local total = math.max(0, p.outTotal)
+        outDuration = math.min(outDuration, total)
+        if count > 1 then
+            outStagger = math.max(0, (total - outDuration) / (count - 1))
+        else
+            outStagger = 0
+        end
+    end
+
+    return {
+        inDuration = inDuration,
+        inStagger = inStagger,
+        outDuration = outDuration,
+        outStagger = outStagger,
+    }
+end
+
+------------------------------------------------------------------------------
+-- Easing
+------------------------------------------------------------------------------
+
+local TWO_PI = 2 * math.pi
+
+-- Damped-spring ease-out.
+--
+-- Penner's elastic-out oscillates about three times.  That is fine at 60 fps
+-- but at the 8-24 frame durations this Fuse is normally used with, the
+-- oscillation is sampled only 2-4 times per cycle: it aliases into a buzz.
+-- This spring starts with zero velocity, then overshoots and settles.  `cycles`
+-- sets how many oscillations fit in t = 0..1, `damping` sets how quickly they
+-- die away.  The result is normalised so it ends at exactly 1 instead of
+-- 1 - epsilon.
+local function springOut(t, cycles, damping)
+    local b = TWO_PI * cycles
+    local function raw(x)
+        local decay = math.exp(-damping * x)
+        return 1 - decay * (math.cos(b * x) + (damping / b) * math.sin(b * x))
+    end
+    return raw(t) / raw(1)
+end
+
+-- Elastic gets its own time warp: phase = t^1.8.  A plain multi-cycle spring
+-- reaches its first peak within the first two frames of a 12-frame entrance,
+-- so almost the whole move happens at once.  Warping the phase leaves the
+-- first frames gentle and still fits 2-4 oscillations into the segment.
+local function elasticOut(t, cycles, damping)
+    cycles = E.sanitizeNumber(cycles, E.ELASTIC_CYCLES,
+        E.ELASTIC_MIN_CYCLES, E.ELASTIC_MAX_CYCLES)
+    damping = E.sanitizeNumber(damping, E.ELASTIC_DAMPING,
+        E.ELASTIC_MIN_DAMPING, E.ELASTIC_MAX_DAMPING)
+    return springOut(t ^ E.ELASTIC_TIME_WARP, cycles, damping)
+end
+
+-- A single, softer overshoot with no secondary wobble.
+local function backOut(t)
+    return springOut(t, 1, 6)
+end
+
+-- Two readable bounces.  Penner's four arcs put each bounce in 1-2 frames at
+-- a 12-frame duration, which reads as jitter rather than a bounce.  Here the
+-- fall takes the first half, then two bounces decay 12% -> 3.5% of the travel.
+-- The fall is quadratic so it starts at rest and accelerates like gravity.
+local function bounceOut(t)
+    local land1, land2 = 0.5, 0.8
+    local height1, height2 = 0.12, 0.035
+    if t < land1 then
+        local s = t / land1
+        return s * s
+    elseif t < land2 then
+        local u = (t - land1) / (land2 - land1)
+        return 1 - height1 * 4 * u * (1 - u)
+    end
+    local u = (t - land2) / (1 - land2)
+    return 1 - height2 * 4 * u * (1 - u)
+end
+
+-- Monotonic fade curve, deliberately independent of the motion easing.
+--
+-- Alpha must never follow an overshooting curve: Bounce Out dips below 1 at
+-- every rebound and Elastic/Back In go negative in the middle, which made the
+-- letter dim, vanish or flash while it moved.  Smoothstep is monotonic and
+-- never leaves 0..1, so the fade always reads as a fade.
+function E.fadeProgress(t)
+    t = E.clamp(tonumber(t) or 0, 0, 1)
+    return t * t * (3 - 2 * t)
+end
+
+-- index must match E.EASING_NAMES.  Elastic, Back and Bounce intentionally
+-- leave 0..1: the overshoot is the effect.  Callers clamp alpha, which must
+-- stay in range, while movement, scale and blur use the curve directly.
+function E.ease(index, t, elasticCycles, elasticDamping)
+    t = E.clamp(tonumber(t) or 0, 0, 1)
+    if t <= 0 then return 0 end
+    if t >= 1 then return 1 end
+    index = E.sanitizeInt(index, E.EASE_DEFAULT, 0, E.EASE_MAX)
+    if index == 0 then                       -- Linear
+        return t
+    elseif index == 1 then                   -- Cubic In
+        return t * t * t
+    elseif index == 2 then                   -- Cubic Out
+        local u = 1 - t
+        return 1 - u * u * u
+    elseif index == 3 then                   -- Cubic In Out
+        if t < 0.5 then return 4 * t * t * t end
+        local u = -2 * t + 2
+        return 1 - (u * u * u) / 2
+    elseif index == 4 then                   -- Elastic In
+        return 1 - elasticOut(1 - t, elasticCycles, elasticDamping)
+    elseif index == 5 then                   -- Elastic Out
+        return elasticOut(t, elasticCycles, elasticDamping)
+    elseif index == 6 then                   -- Back In
+        return 1 - backOut(1 - t)
+    elseif index == 7 then                   -- Back Out
+        return backOut(t)
+    elseif index == 8 then                   -- Bounce Out
+        return bounceOut(t)
+    elseif index == 9 then                   -- Expo In
+        return 2 ^ (10 * t - 10)
+    elseif index == 10 then                  -- Expo Out
+        return 1 - 2 ^ (-10 * t)
+    end
+    return -(math.cos(math.pi * t) - 1) / 2  -- Sine In Out
+end
+
+-----------------------------------------------------------------------------
+-- Parameter validation
+-----------------------------------------------------------------------------
+
+function E.directionVectors(index)
+    local d = E.DIRECTIONS[E.sanitizeInt(index, 1, 0, 8)] or E.DIRECTIONS[0]
+    return d[1], d[2], d[3], d[4]
+end
+
+-- raw fields use UI units where noted.  scaleIn/scaleOut are fractions
+-- (1.0 = 100%), because the Fuse wrapper divides the percentage inputs.
+function E.sanitizeParams(raw)
+    raw = raw or {}
+    local p = {}
+    p.mode = E.sanitizeInt(raw.mode, E.MODE_IN_OUT, 0, 3)
+    p.sequenceMode = E.sanitizeInt(raw.sequenceMode, E.SEQ_CHARACTER, 0, 2)
+    p.order = E.sanitizeInt(raw.order, E.ORDER_FORWARD, 0, 4)
+    p.seed = E.sanitizeInt(raw.seed, 12345, 0, 2147483646)
+    p.startFrame = E.sanitizeNumber(raw.startFrame, 0, -1000000, 1000000)
+    p.exitStart = E.sanitizeNumber(raw.exitStart, 72, -1000000, 1000000)
+    p.speed = E.sanitizeNumber(raw.speed, 1, 0.01, 100)
+    p.inDuration = E.sanitizeNumber(raw.inDuration, 12, 0, 100000)
+    p.inStagger = E.sanitizeNumber(raw.inStagger, 2, 0, 100000)
+    p.outDuration = E.sanitizeNumber(raw.outDuration, 12, 0, 100000)
+    p.outStagger = E.sanitizeNumber(raw.outStagger, 2, 0, 100000)
+    p.inTotal = E.sanitizeNumber(raw.inTotal, 60, 0, 100000)
+    p.outTotal = E.sanitizeNumber(raw.outTotal, 60, 0, 100000)
+    p.fitIn = E.sanitizeBool(raw.fitIn, false)
+    p.fitOut = E.sanitizeBool(raw.fitOut, false)
+
+    p.direction = E.sanitizeInt(raw.direction, 1, 0, 8)
+    local dix, diy, dox, doy = E.directionVectors(p.direction)
+    p.dirInX, p.dirInY, p.dirOutX, p.dirOutY = dix, diy, dox, doy
+    p.distance = E.sanitizeNumber(raw.distance, 40, 0, 5000)
+    p.settle = E.sanitizeBool(raw.settle, true)
+    p.scaleIn = E.sanitizeNumber(raw.scaleIn, 1, 0.01, 10)
+    p.scaleOut = E.sanitizeNumber(raw.scaleOut, 1, 0.01, 10)
+    p.rotationIn = E.sanitizeNumber(raw.rotationIn, 0, -E.ROTATION_LIMIT, E.ROTATION_LIMIT)
+    p.rotationOut = E.sanitizeNumber(raw.rotationOut, 0, -E.ROTATION_LIMIT, E.ROTATION_LIMIT)
+    p.trackingIn = E.sanitizeNumber(raw.trackingIn, 0, -2000, 2000)
+    p.trackingOut = E.sanitizeNumber(raw.trackingOut, 0, -2000, 2000)
+    p.intensity = E.sanitizeNumber(raw.intensity, 1, 0, 2)
+
+    p.easingIn = E.sanitizeInt(raw.easingIn, E.EASE_DEFAULT, 0, E.EASE_MAX)
+    p.easingOut = E.sanitizeInt(raw.easingOut, E.EASE_DEFAULT_OUT, 0, E.EASE_MAX)
+    p.elasticCycles = E.sanitizeNumber(raw.elasticCycles, E.ELASTIC_CYCLES,
+        E.ELASTIC_MIN_CYCLES, E.ELASTIC_MAX_CYCLES)
+    p.elasticDamping = E.sanitizeNumber(raw.elasticDamping, E.ELASTIC_DAMPING,
+        E.ELASTIC_MIN_DAMPING, E.ELASTIC_MAX_DAMPING)
+
+    p.fade = E.sanitizeBool(raw.fade, true)
+    p.blur = E.sanitizeBool(raw.blur, true)
+    p.blurAmount = E.sanitizeNumber(raw.blurAmount, 12, 0, 500)
+    p.maxBlur = E.sanitizeNumber(raw.maxBlur, 120, 0, 500)
+
+    p.size = E.sanitizeNumber(raw.size, 96, 1, 4000)
+    p.tracking = E.sanitizeNumber(raw.tracking, 0, -2000, 2000)
+    p.lineSpacing = E.sanitizeNumber(raw.lineSpacing, 1, 0.1, 5)
+    p.align = E.sanitizeInt(raw.align, E.ALIGN_CENTER, 0, 2)
+    p.valign = E.sanitizeInt(raw.valign, E.VALIGN_MIDDLE, 0, 2)
+    p.posX = E.sanitizeNumber(raw.posX, 0.5, -10, 10)
+    p.posY = E.sanitizeNumber(raw.posY, 0.5, -10, 10)
+    p.opacity = E.sanitizeNumber(raw.opacity, 1, 0, 1)
+
+    p.masterScale = E.sanitizeNumber(raw.masterScale, 1, 0.01, 10)
+    p.masterRotation = E.sanitizeNumber(raw.masterRotation, 0, -3600, 3600)
+
+    p.textR = E.sanitizeNumber(raw.textR, 1, 0, 1)
+    p.textG = E.sanitizeNumber(raw.textG, 1, 0, 1)
+    p.textB = E.sanitizeNumber(raw.textB, 1, 0, 1)
+    p.textA = E.sanitizeNumber(raw.textA, 1, 0, 1)
+
+    p.outline = E.sanitizeBool(raw.outline, false)
+    p.outlineThickness = E.sanitizeNumber(raw.outlineThickness, 2, 0, 200)
+    p.outlineR = E.sanitizeNumber(raw.outlineR, 0, 0, 1)
+    p.outlineG = E.sanitizeNumber(raw.outlineG, 0, 0, 1)
+    p.outlineB = E.sanitizeNumber(raw.outlineB, 0, 0, 1)
+    p.outlineA = E.sanitizeNumber(raw.outlineA, 1, 0, 1)
+
+    -- Diagnostic flag only. Not part of the documented animation controls.
+    p.testFrame = raw.testFrame and true or false
+
+    return p
+end
+
+-----------------------------------------------------------------------------
+-- Per-segment state
+-----------------------------------------------------------------------------
+
+-- t is local animation time in frames.  rank is the segment's 0-based order.
+-- Returns alpha (0..1, before the global text opacity is applied),
+-- dx/dy in pixels, blur in pixels, scale (1 = normal), rotation in degrees
+-- (0 = upright, added to Master Rotation) and tracking in pixels per gap.
+function E.evaluateSegment(p, t, rank, timing)
+    local st = { alpha = 1, dx = 0, dy = 0, blur = 0, scale = 1, rotation = 0,
+        tracking = 0, animating = false }
+    if p.mode == E.MODE_NONE then return st end
+
+    local inStart = rank * timing.inStagger
+    local inEnd = inStart + timing.inDuration
+    local outStart = p.exitStart + rank * timing.outStagger
+    local outEnd = outStart + timing.outDuration
+    -- Exit cannot begin before entrance has finished for the same segment.
+    if p.mode == E.MODE_IN_OUT and outStart < inEnd then
+        outStart = inEnd
+        outEnd = outStart + timing.outDuration
+    end
+
+    local hasIn = (p.mode == E.MODE_IN_OUT or p.mode == E.MODE_IN_ONLY)
+    local hasOut = (p.mode == E.MODE_IN_OUT or p.mode == E.MODE_OUT_ONLY)
+    local radius = p.distance * p.intensity
+    -- When Settle To Layout is off, the entrance displacement is retained.
+    local restX, restY = 0, 0
+    if hasIn and not p.settle then
+        restX = p.dirInX * radius
+        restY = p.dirInY * radius
+    end
+
+    if hasIn and t < inEnd then
+        -- Still inside the entrance: never batch this glyph into the static
+        -- pass, even on a frame where the curve happens to return to rest
+        -- (Bounce Out touches 0 displacement at each landing).
+        st.animating = true
+        local progress
+        if t < inStart then
+            progress = 0
+            st.alpha = 0
+        else
+            if timing.inDuration <= 0 then
+                progress = 1
+            else
+                progress = (t - inStart) / timing.inDuration
+            end
+            progress = E.clamp(progress, 0, 1)
+        end
+        local e = E.ease(p.easingIn, progress, p.elasticCycles, p.elasticDamping)
+        local factor
+        if p.settle then
+            factor = 1 - e
+        else
+            factor = 2 - e
+        end
+        st.dx = p.dirInX * radius * factor
+        st.dy = p.dirInY * radius * factor
+        if p.fade then st.alpha = E.fadeProgress(progress) else st.alpha = 1 end
+        if t < inStart then st.alpha = 0 end
+        if p.blur then
+            st.blur = math.max(0, p.blurAmount * (1 - e) * p.intensity)
+        end
+        st.scale = math.max(0.01, 1 + (p.scaleIn - 1) * (1 - e) * p.intensity)
+        st.rotation = p.rotationIn * (1 - e) * p.intensity
+        st.tracking = p.trackingIn * (1 - e) * p.intensity
+        return st
+    end
+
+    if hasOut and t >= outStart then
+        if t >= outEnd then
+            st.alpha = 0
+            return st
+        end
+        st.animating = true
+        local progress
+        if timing.outDuration <= 0 then
+            progress = 1
+        else
+            progress = (t - outStart) / timing.outDuration
+        end
+        progress = E.clamp(progress, 0, 1)
+        local e = E.ease(p.easingOut, progress, p.elasticCycles, p.elasticDamping)
+        if hasIn and not p.settle then
+            -- Continue from the retained entrance position and travel a full
+            -- distance in the exit direction.
+            st.dx = restX + p.dirOutX * radius * 2 * e
+            st.dy = restY + p.dirOutY * radius * 2 * e
+        else
+            st.dx = p.dirOutX * radius * e
+            st.dy = p.dirOutY * radius * e
+        end
+        if p.fade then st.alpha = 1 - E.fadeProgress(progress) else st.alpha = 1 end
+        if p.blur then
+            st.blur = math.max(0, p.blurAmount * e * p.intensity)
+        end
+        st.scale = math.max(0.01, 1 + (p.scaleOut - 1) * e * p.intensity)
+        st.rotation = p.rotationOut * e * p.intensity
+        st.tracking = p.trackingOut * e * p.intensity
+        return st
+    end
+
+    st.dx = restX
+    st.dy = restY
+    return st
+end
+
+function E.isFinalState(st)
+    return st.alpha >= 0.9999
+        and math.abs(st.dx) < 1e-6
+        and math.abs(st.dy) < 1e-6
+        and st.blur < 1e-6
+        and math.abs(st.scale - 1) < 1e-6
+        and math.abs(st.rotation or 0) < 1e-6
+        and math.abs(st.tracking or 0) < 1e-6
+end
+
+-- Whether this glyph must be drawn through the per-glyph cell path.
+--
+-- Geometry alone is not enough: Bounce Out returns to zero displacement at
+-- every landing while the segment is still animating.  Treating those frames
+-- as settled switched the glyph from a cell to the static batched shape for
+-- exactly one frame, which showed up as a pop.  The animating flag keeps the
+-- render path stable for the whole entrance/exit.
+function E.needsCell(st)
+    if st.alpha <= 0.001 then return false end
+    return st.animating or not E.isFinalState(st)
+end
+
+-----------------------------------------------------------------------------
+-- Presets
+-----------------------------------------------------------------------------
+
+E.DEFAULT_ANIMATION = {
+    SequenceMode = 0,
+    SequenceOrder = 0,
+    RandomSeed = 12345,
+    StartFrame = 0,
+    ExitStart = 72,
+    Speed = 1,
+    InDuration = 12,
+    InStagger = 2,
+    FitIn = 0,
+    InTotal = 60,
+    OutDuration = 12,
+    OutStagger = 2,
+    FitOut = 0,
+    OutTotal = 60,
+    Direction = 1,
+    Distance = 40,
+    Settle = 1,
+    ScaleIn = 100,
+    ScaleOut = 100,
+    RotationIn = 0,
+    RotationOut = 0,
+    TrackingIn = 0,
+    TrackingOut = 0,
+    EaseIn = 2,
+    EaseOut = 3,
+    Fade = 1,
+    Blur = 1,
+    BlurAmount = 12,
+    MaxBlur = 120,
+    MasterIntensity = 1,
+}
+
+E.PRESETS = {
+    {
+        name = "Default",
+        values = {},
+    },
+    {
+        name = "Fade",
+        values = {
+            SequenceMode = 0, SequenceOrder = 0,
+            InDuration = 16, InStagger = 1.5,
+            OutDuration = 12, OutStagger = 1.5,
+            Direction = 0, Distance = 0,
+            EaseIn = 2, EaseOut = 2,
+            Fade = 1, Blur = 0, BlurAmount = 0,
+            ScaleIn = 100, ScaleOut = 100,
+            RotationIn = 0, RotationOut = 0,
+            TrackingIn = 0, TrackingOut = 0,
+        },
+    },
+    {
+        name = "Elastic",
+        values = {
+            SequenceMode = 0, SequenceOrder = 0,
+            InDuration = 24, InStagger = 1.5,
+            OutDuration = 12, OutStagger = 1.5,
+            Direction = 1, Distance = 30,
+            EaseIn = 5, EaseOut = 2,
+            Fade = 1, Blur = 0, BlurAmount = 0,
+            ScaleIn = 70, ScaleOut = 100,
+            RotationIn = 0, RotationOut = 0,
+            TrackingIn = 0, TrackingOut = 0,
+        },
+    },
+    {
+        name = "Slide",
+        values = {
+            SequenceMode = 0, SequenceOrder = 0,
+            InDuration = 18, InStagger = 1.5,
+            OutDuration = 12, OutStagger = 1.5,
+            Direction = 4, Distance = 80,
+            EaseIn = 2, EaseOut = 2,
+            Fade = 1, Blur = 0, BlurAmount = 0,
+            ScaleIn = 100, ScaleOut = 100,
+            RotationIn = 0, RotationOut = 0,
+            TrackingIn = 0, TrackingOut = 0,
+        },
+    },
+    {
+        name = "Scale",
+        values = {
+            SequenceMode = 0, SequenceOrder = 0,
+            InDuration = 16, InStagger = 1.5,
+            OutDuration = 12, OutStagger = 1.5,
+            Direction = 0, Distance = 0,
+            EaseIn = 2, EaseOut = 2,
+            Fade = 1, Blur = 0, BlurAmount = 0,
+            ScaleIn = 50, ScaleOut = 50,
+            RotationIn = 0, RotationOut = 0,
+            TrackingIn = 0, TrackingOut = 0,
+        },
+    },
+}
+
+function E.presetValues(index)
+    local result = {}
+    for k, v in pairs(E.DEFAULT_ANIMATION) do result[k] = v end
+    index = math.floor(tonumber(index) or 0)
+    local preset = E.PRESETS[index + 1]
+    if preset then
+        for k, v in pairs(preset.values) do result[k] = v end
+    end
+    return result
+end
+
+function E.presetName(index)
+    local preset = E.PRESETS[(math.floor(tonumber(index) or 0)) + 1]
+    return preset and preset.name or "Default"
+end
+
+--===========================================================================
+-- PART 2 - FUSE UI
+--===========================================================================
+
+local selectedPreset = 0
+local PresetInputs = {}
+
+local function addColorGroup(tool, prefix, label, group, r, g, b, a)
+    local InR = tool:AddInput("Red", prefix .. "R", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ColorControl",
+        IC_ControlGroup = group,
+        IC_ControlID = 0,
+        ICS_Name = label,
+        INP_MinScale = 0,
+        INP_MaxScale = 1,
+        INP_MinAllowed = 0,
+        INP_MaxAllowed = 1,
+        INP_Default = r,
+    })
+    local InG = tool:AddInput("Green", prefix .. "G", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ColorControl",
+        IC_ControlGroup = group,
+        IC_ControlID = 1,
+        ICS_Name = label,
+        INP_MinScale = 0,
+        INP_MaxScale = 1,
+        INP_MinAllowed = 0,
+        INP_MaxAllowed = 1,
+        INP_Default = g,
+    })
+    local InB = tool:AddInput("Blue", prefix .. "B", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ColorControl",
+        IC_ControlGroup = group,
+        IC_ControlID = 2,
+        ICS_Name = label,
+        INP_MinScale = 0,
+        INP_MaxScale = 1,
+        INP_MinAllowed = 0,
+        INP_MaxAllowed = 1,
+        INP_Default = b,
+    })
+    local InA = tool:AddInput("Alpha", prefix .. "A", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ColorControl",
+        IC_ControlGroup = group,
+        IC_ControlID = 3,
+        ICS_Name = label,
+        INP_MinScale = 0,
+        INP_MaxScale = 1,
+        INP_MinAllowed = 0,
+        INP_MaxAllowed = 1,
+        INP_Default = a,
+    })
+    return InR, InG, InB, InA
+end
+
+-- Image I/O is created separately and first.
+--
+-- Background deliberately has NO LINK_Main attribute.  LINK_Main marks an
+-- input as one of the tool's *main* image inputs (1 = first, 2 = second), and
+-- Fusion builds the render request around those.  An optional background that
+-- is normally unconnected must be an ordinary image input instead:
+--
+--   LINK_Main = 1 (1.0.0-1.0.3): tool treated as a filter with a missing main
+--     image -> Media Out "cannot get Parameter for Input", Process never called.
+--   LINK_Main = 2 (1.0.4): still a main input, but the Output's LINK_Main = 1
+--     then refers to a main input that does not exist -> same failure.
+--   no LINK_Main (1.0.5+): the Fuse is a generator with an optional image
+--     input, the same shape as the built-in Text+ background input.
+local function makeOutput()
+    OutImage = self:AddOutput("Output", "Output", {
+        LINKID_DataType = "Image",
+        LINK_Main = 1,
+    })
+end
+
+local function buildIO()
+    InBackground = self:AddInput("Background", "Background", {
+        LINKID_DataType = "Image",
+        INP_Required = false,
+        INPS_StatusText = "Optional background image. Without it the comp frame size is used.",
+    })
+    makeOutput()
+end
+
+-- Tabs are created with a single call; every control that follows belongs to
+-- that page until the next call.  The call is guarded so a host that does not
+-- expose AddControlPage still gets a working, if untabbed, Inspector.
+local function addControlPage(name)
+    if type(self.AddControlPage) ~= "function" then
+        dbg("addControlPage: unsupported host, continuing without tab", name)
+        return false
+    end
+    local ok, err = pcall(function() self:AddControlPage(name) end)
+    if not ok then
+        dbg("addControlPage failed for", name, ":", tostring(err))
+        return false
+    end
+    return true
+end
+
+local function buildControls()
+    addControlPage("Text")
+
+    -------------------------------------------------------------------------
+    -- Presets
+    -------------------------------------------------------------------------
+    self:BeginControlNest("Presets", "Presets", true)
+    InPreset = self:AddInput("Preset", "Preset", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ComboControl",
+        INP_Integer = true,
+        INP_DoNotifyChanged = true,
+        INP_External = false,
+        INP_Default = 0,
+        { CCS_AddString = "Default" },
+        { CCS_AddString = "Fade" },
+        { CCS_AddString = "Elastic" },
+        { CCS_AddString = "Slide" },
+        { CCS_AddString = "Scale" },
+    })
+    InApplyPreset = self:AddInput("Apply Preset", "ApplyPreset", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ButtonControl",
+        INP_DoNotifyChanged = true,
+        INP_External = false,
+        INP_Default = 0,
+        BTNC_Align = "Left",
+    })
+    self:AddInput("Presets change animation controls only; text, font, colour, size and position are preserved.", "PresetHelp", {
+        LINKID_DataType = "Text",
+        INPID_InputControl = "LabelControl",
+        INP_Passive = true,
+        INP_External = false,
+    })
+    self:EndControlNest()
+
+    -------------------------------------------------------------------------
+    -- Text
+    -------------------------------------------------------------------------
+    self:BeginControlNest("Text", "TextNest", true)
+    InText = self:AddInput("Text", "Text", {
+        LINKID_DataType = "Text",
+        INPID_InputControl = "TextEditControl",
+        INPS_DefaultText = "TEXT ANIMATOR\nMADE FOR FUSION",
+        TEC_Lines = 4,
+        TEC_Wrap = true,
+    })
+    self:EndControlNest()
+
+    -------------------------------------------------------------------------
+    -- Style: typography and outline
+    -------------------------------------------------------------------------
+    addControlPage("Style")
+    self:BeginControlNest("Typography", "TypographyNest", true)
+    InFont = self:AddInput("Font", "Font", {
+        LINKID_DataType = "Text",
+        INPID_InputControl = "FontFileControl",
+        IC_ControlGroup = 2,
+        IC_ControlID = 0,
+        INP_Level = 1,
+        INP_DoNotifyChanged = true,
+        INP_External = false,
+    })
+    InFontStyle = self:AddInput("Style", "FontStyle", {
+        LINKID_DataType = "Text",
+        INPID_InputControl = "FontFileControl",
+        IC_ControlGroup = 2,
+        IC_ControlID = 1,
+        INP_Level = 1,
+        INP_DoNotifyChanged = true,
+        INP_External = false,
+    })
+    InSize = self:AddInput("Size (px)", "Size", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 8,
+        INP_MaxScale = 400,
+        INP_MinAllowed = 1,
+        INP_MaxAllowed = 4000,
+        INP_Default = 96,
+        INP_DoNotifyChanged = false,
+    })
+    InAlign = self:AddInput("Alignment", "Alignment", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ComboControl",
+        INP_Integer = true,
+        INP_Default = 1,
+        { CCS_AddString = "Left" },
+        { CCS_AddString = "Center" },
+        { CCS_AddString = "Right" },
+    })
+    InVAlign = self:AddInput("Vertical Alignment", "VAlignment", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ComboControl",
+        INP_Integer = true,
+        INP_Default = 1,
+        { CCS_AddString = "Top" },
+        { CCS_AddString = "Middle" },
+        { CCS_AddString = "Bottom" },
+    })
+    InTracking = self:AddInput("Tracking (px)", "Tracking", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = -20,
+        INP_MaxScale = 80,
+        INP_MinAllowed = -2000,
+        INP_MaxAllowed = 2000,
+        INP_Default = 0,
+    })
+    InLineSpacing = self:AddInput("Line Spacing", "LineSpacing", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.5,
+        INP_MaxScale = 3,
+        INP_MinAllowed = 0.1,
+        INP_MaxAllowed = 5,
+        INP_Default = 1,
+    })
+    InPosition = self:AddInput("Position", "Position", {
+        LINKID_DataType = "Point",
+        INPID_InputControl = "OffsetControl",
+        INP_DefaultX = 0.5,
+        INP_DefaultY = 0.5,
+    })
+    InOpacity = self:AddInput("Opacity", "Opacity", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0,
+        INP_MaxScale = 1,
+        INP_MinAllowed = 0,
+        INP_MaxAllowed = 1,
+        INP_Default = 1,
+    })
+    InTextR, InTextG, InTextB, InTextA = addColorGroup(self, "TextColor", "Text Colour", 3, 1, 1, 1, 1)
+    self:EndControlNest()
+
+    self:BeginControlNest("Outline", "OutlineNest", true)
+    InOutline = self:AddInput("Enable Outline", "Outline", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "CheckboxControl",
+        INP_Integer = true,
+        INP_Default = 0,
+    })
+    InOutlineThickness = self:AddInput("Outline Thickness (px)", "OutlineThickness", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0,
+        INP_MaxScale = 12,
+        INP_MinAllowed = 0,
+        INP_MaxAllowed = 200,
+        INP_Default = 2,
+    })
+    InOutlineR, InOutlineG, InOutlineB, InOutlineA = addColorGroup(self, "OutlineColor", "Outline Colour", 4, 0, 0, 0, 1)
+    self:EndControlNest()
+
+    -------------------------------------------------------------------------
+    -- Animation: sequence, timing, movement, easing, fade and blur
+    addControlPage("Animation")
+
+    -------------------------------------------------------------------------
+    -- Sequence
+    -------------------------------------------------------------------------
+    self:BeginControlNest("Sequence", "Sequence", true)
+    InSequence = self:AddInput("Animate By", "SequenceMode", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ComboControl",
+        INP_Integer = true,
+        INP_Default = 0,
+        { CCS_AddString = "Characters" },
+        { CCS_AddString = "Words" },
+        { CCS_AddString = "Lines" },
+    })
+    InAnimMode = self:AddInput("Animation", "AnimationMode", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ComboControl",
+        INP_Integer = true,
+        INP_Default = 0,
+        INPS_StatusText = "In and Out plays entrance, hold and exit. In Only stops after the entrance. Out Only has no entrance. None renders static text.",
+        { CCS_AddString = "In and Out" },
+        { CCS_AddString = "In Only" },
+        { CCS_AddString = "Out Only" },
+        { CCS_AddString = "None" },
+    })
+    InOrder = self:AddInput("Order", "Order", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ComboControl",
+        INP_Integer = true,
+        INP_Default = 0,
+        { CCS_AddString = "Forward" },
+        { CCS_AddString = "Reverse" },
+        { CCS_AddString = "Center Out" },
+        { CCS_AddString = "Outside In" },
+        { CCS_AddString = "Random" },
+    })
+    InSeed = self:AddInput("Random Seed", "RandomSeed", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ScrewControl",
+        INP_Integer = true,
+        INP_MinAllowed = 0,
+        INP_MaxAllowed = 2147483646,
+        INP_Default = 12345,
+    })
+    self:EndControlNest()
+
+    -------------------------------------------------------------------------
+    -- Timing
+    -------------------------------------------------------------------------
+    self:BeginControlNest("Timing", "Timing", true)
+    InStartFrame = self:AddInput("Start Frame", "StartFrame", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ScrewControl",
+        INP_Integer = true,
+        INP_MinAllowed = -1000000,
+        INP_MaxAllowed = 1000000,
+        INP_Default = 0,
+    })
+    InExitStart = self:AddInput("Exit Start Frame", "ExitStartFrame", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ScrewControl",
+        INP_Integer = true,
+        INP_MinAllowed = -1000000,
+        INP_MaxAllowed = 1000000,
+        INP_Default = 72,
+    })
+    InSpeed = self:AddInput("Speed", "Speed", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.25,
+        INP_MaxScale = 4,
+        INP_MinAllowed = 0.01,
+        INP_MaxAllowed = 100,
+        INP_Default = 1,
+    })
+    InDuration = self:AddInput("In Duration (frames)", "InDuration", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ScrewControl",
+        INP_MinAllowed = 0,
+        INP_MaxAllowed = 100000,
+        INP_Default = 12,
+    })
+    InStagger = self:AddInput("In Stagger (frames)", "InStagger", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ScrewControl",
+        INP_MinAllowed = 0,
+        INP_MaxAllowed = 100000,
+        INP_Default = 2,
+    })
+    InFitIn = self:AddInput("Fit In To Total", "FitIn", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "CheckboxControl",
+        INP_Integer = true,
+        INP_Default = 0,
+    })
+    InInTotal = self:AddInput("In Total (frames)", "InTotal", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ScrewControl",
+        INP_MinAllowed = 0,
+        INP_MaxAllowed = 100000,
+        INP_Default = 60,
+    })
+    InOutDuration = self:AddInput("Out Duration (frames)", "OutDuration", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ScrewControl",
+        INP_MinAllowed = 0,
+        INP_MaxAllowed = 100000,
+        INP_Default = 12,
+    })
+    InOutStagger = self:AddInput("Out Stagger (frames)", "OutStagger", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ScrewControl",
+        INP_MinAllowed = 0,
+        INP_MaxAllowed = 100000,
+        INP_Default = 2,
+    })
+    InFitOut = self:AddInput("Fit Out To Total", "FitOut", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "CheckboxControl",
+        INP_Integer = true,
+        INP_Default = 0,
+    })
+    InOutTotal = self:AddInput("Out Total (frames)", "OutTotal", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ScrewControl",
+        INP_MinAllowed = 0,
+        INP_MaxAllowed = 100000,
+        INP_Default = 60,
+    })
+    self:AddInput("Start and exit frames are absolute composition frames. Durations and staggers are frames at Speed 1.", "TimingHelp", {
+        LINKID_DataType = "Text",
+        INPID_InputControl = "LabelControl",
+        INP_Passive = true,
+        INP_External = false,
+    })
+    self:EndControlNest()
+
+    -------------------------------------------------------------------------
+    -- Movement
+    -------------------------------------------------------------------------
+    self:BeginControlNest("Movement", "Movement", true)
+    InDirection = self:AddInput("Direction", "Direction", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ComboControl",
+        INP_Integer = true,
+        INP_Default = 1,
+        { CCS_AddString = "None" },
+        { CCS_AddString = "Up" },
+        { CCS_AddString = "Down" },
+        { CCS_AddString = "Left" },
+        { CCS_AddString = "Right" },
+        { CCS_AddString = "Up Left" },
+        { CCS_AddString = "Up Right" },
+        { CCS_AddString = "Down Left" },
+        { CCS_AddString = "Down Right" },
+    })
+    InDistance = self:AddInput("Distance (px)", "Distance", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0,
+        INP_MaxScale = 200,
+        INP_MinAllowed = 0,
+        INP_MaxAllowed = 5000,
+        INP_Default = 40,
+    })
+    InSettle = self:AddInput("Settle To Layout", "SettleToLayout", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "CheckboxControl",
+        INP_Integer = true,
+        INP_Default = 1,
+        INPS_StatusText = "On: segments arrive at their final layout position. Off: entrance displacement is retained.",
+    })
+    InScaleIn = self:AddInput("In Scale %", "InScale", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 10,
+        INP_MaxScale = 300,
+        INP_MinAllowed = 1,
+        INP_MaxAllowed = 1000,
+        INP_Default = 100,
+    })
+    InScaleOut = self:AddInput("Out Scale %", "OutScale", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 10,
+        INP_MaxScale = 300,
+        INP_MinAllowed = 1,
+        INP_MaxAllowed = 1000,
+        INP_Default = 100,
+    })
+    InRotation = self:AddInput("In Rotation (deg)", "InRotation", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = -180,
+        INP_MaxScale = 180,
+        INP_MinAllowed = -E.ROTATION_LIMIT,
+        INP_MaxAllowed = E.ROTATION_LIMIT,
+        INP_Default = 0,
+        INPS_StatusText = "Angle the segment starts at on entrance; eases to 0. Positive matches Master Rotation.",
+    })
+    InRotationOut = self:AddInput("Out Rotation (deg)", "OutRotation", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = -180,
+        INP_MaxScale = 180,
+        INP_MinAllowed = -E.ROTATION_LIMIT,
+        INP_MaxAllowed = E.ROTATION_LIMIT,
+        INP_Default = 0,
+        INPS_StatusText = "Angle the segment rotates to on exit, starting from 0.",
+    })
+    InTrackingIn = self:AddInput("In Tracking (px)", "InTracking", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = -100,
+        INP_MaxScale = 100,
+        INP_MinAllowed = -2000,
+        INP_MaxAllowed = 2000,
+        INP_Default = 0,
+        INPS_StatusText = "Extra space between characters at the start of the entrance. Positive spreads, negative tightens.",
+    })
+    InTrackingOut = self:AddInput("Out Tracking (px)", "OutTracking", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = -100,
+        INP_MaxScale = 100,
+        INP_MinAllowed = -2000,
+        INP_MaxAllowed = 2000,
+        INP_Default = 0,
+        INPS_StatusText = "Extra space between characters at the end of the exit. Positive spreads, negative tightens.",
+    })
+    self:AddInput("Movement, scale, rotation and tracking apply independently of fade and blur.", "MovementHelp", {
+        LINKID_DataType = "Text",
+        INPID_InputControl = "LabelControl",
+        INP_Passive = true,
+        INP_External = false,
+    })
+    self:EndControlNest()
+
+    -------------------------------------------------------------------------
+    -- Easing
+    -------------------------------------------------------------------------
+    self:BeginControlNest("Easing", "Easing", true)
+    InEaseIn = self:AddInput("Entrance Easing", "EaseIn", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ComboControl",
+        INP_Integer = true,
+        INP_Default = E.EASE_DEFAULT,
+        { CCS_AddString = "Linear" },
+        { CCS_AddString = "Cubic In" },
+        { CCS_AddString = "Cubic Out" },
+        { CCS_AddString = "Cubic In Out" },
+        { CCS_AddString = "Elastic In" },
+        { CCS_AddString = "Elastic Out" },
+        { CCS_AddString = "Back In" },
+        { CCS_AddString = "Back Out" },
+        { CCS_AddString = "Bounce Out" },
+        { CCS_AddString = "Expo In" },
+        { CCS_AddString = "Expo Out" },
+        { CCS_AddString = "Sine In Out" },
+    })
+    InEaseOut = self:AddInput("Exit Easing", "EaseOut", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ComboControl",
+        INP_Integer = true,
+        INP_Default = E.EASE_DEFAULT_OUT,
+        { CCS_AddString = "Linear" },
+        { CCS_AddString = "Cubic In" },
+        { CCS_AddString = "Cubic Out" },
+        { CCS_AddString = "Cubic In Out" },
+        { CCS_AddString = "Elastic In" },
+        { CCS_AddString = "Elastic Out" },
+        { CCS_AddString = "Back In" },
+        { CCS_AddString = "Back Out" },
+        { CCS_AddString = "Bounce Out" },
+        { CCS_AddString = "Expo In" },
+        { CCS_AddString = "Expo Out" },
+        { CCS_AddString = "Sine In Out" },
+    })
+    InElasticCycles = self:AddInput("Elastic Oscillations", "ElasticCycles", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 1,
+        INP_MaxScale = 4,
+        INP_MinAllowed = 1,
+        INP_MaxAllowed = 4,
+        INP_Default = E.ELASTIC_CYCLES,
+    })
+    InElasticDamping = self:AddInput("Elastic Damping", "ElasticDamping", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 2,
+        INP_MaxScale = 20,
+        INP_MinAllowed = 2,
+        INP_MaxAllowed = 20,
+        INP_Default = E.ELASTIC_DAMPING,
+    })
+    self:AddInput("Elastic Oscillations and Damping apply to Elastic In/Out only. More oscillations add wobble; higher damping reduces overshoot.", "ElasticHelp", {
+        LINKID_DataType = "Text",
+        INPID_InputControl = "LabelControl",
+        INP_Passive = true,
+        INP_External = false,
+    })
+    self:AddInput("Elastic and Back overshoot; Bounce settles with extra bounces. Alpha stays 0-1.", "EaseHelp", {
+        LINKID_DataType = "Text",
+        INPID_InputControl = "LabelControl",
+        INP_Passive = true,
+        INP_External = false,
+    })
+    self:EndControlNest()
+
+    -------------------------------------------------------------------------
+    -- Fade and Blur
+    -------------------------------------------------------------------------
+    self:BeginControlNest("Fade", "FadeNest", true)
+    InFade = self:AddInput("Enable Fade", "Fade", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "CheckboxControl",
+        INP_Integer = true,
+        INP_Default = 1,
+    })
+    self:AddInput("Fade off uses hard cuts at the start and end of a segment's animation.", "FadeHelp", {
+        LINKID_DataType = "Text",
+        INPID_InputControl = "LabelControl",
+        INP_Passive = true,
+        INP_External = false,
+    })
+    self:EndControlNest()
+
+    self:BeginControlNest("Blur", "BlurNest", true)
+    InBlur = self:AddInput("Enable Blur", "Blur", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "CheckboxControl",
+        INP_Integer = true,
+        INP_Default = 1,
+    })
+    InBlurAmount = self:AddInput("Blur Amount (px)", "BlurAmount", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0,
+        INP_MaxScale = 60,
+        INP_MinAllowed = 0,
+        INP_MaxAllowed = 500,
+        INP_Default = 12,
+    })
+    InMaxBlur = self:AddInput("Max Blur (px)", "MaxBlur", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0,
+        INP_MaxScale = 200,
+        INP_MinAllowed = 0,
+        INP_MaxAllowed = 500,
+        INP_Default = 120,
+        INPS_StatusText = "Clamp for extreme values. Very large blur is expensive.",
+    })
+    self:EndControlNest()
+
+    -------------------------------------------------------------------------
+    -- Advanced
+    -------------------------------------------------------------------------
+    addControlPage("Advanced")
+    self:BeginControlNest("Advanced", "Advanced", false)
+    InMasterIntensity = self:AddInput("Master Intensity", "MasterIntensity", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0,
+        INP_MaxScale = 1,
+        INP_MinAllowed = 0,
+        INP_MaxAllowed = 2,
+        INP_Default = 1,
+        INPS_StatusText = "Scales displacement, blur and scale pop. Fade is unchanged.",
+    })
+    InMasterScale = self:AddInput("Master Scale", "MasterScale", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = 0.25,
+        INP_MaxScale = 4,
+        INP_MinAllowed = 0.01,
+        INP_MaxAllowed = 10,
+        INP_Default = 1,
+    })
+    InMasterRotation = self:AddInput("Master Rotation (deg)", "MasterRotation", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_MinScale = -180,
+        INP_MaxScale = 180,
+        INP_MinAllowed = -3600,
+        INP_MaxAllowed = 3600,
+        INP_Default = 0,
+    })
+    self:AddInput("Text Animator " .. E.VERSION .. " - native Fuse rendering", "VersionLabel", {
+        LINKID_DataType = "Text",
+        INPID_InputControl = "LabelControl",
+        INP_Passive = true,
+        INP_External = false,
+    })
+    self:EndControlNest()
+
+    -------------------------------------------------------------------------
+    -- Diagnostics (temporary, removed once rendering is verified in Resolve)
+    -------------------------------------------------------------------------
+    self:BeginControlNest("Diagnostics", "DiagnosticsNest", false)
+    InTestFrame = self:AddInput("Solid Test Frame", "TestFrame", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "CheckboxControl",
+        INP_Integer = true,
+        INP_Default = 0,
+        INPS_StatusText = "Outputs a solid magenta frame, bypassing all text rendering. " ..
+            "Use it to check that the Fuse itself can deliver an image.",
+    })
+    self:AddInput("Diagnostic control: turn off for normal output.", "DiagnosticsHelp", {
+        LINKID_DataType = "Text",
+        INPID_InputControl = "LabelControl",
+        INP_Passive = true,
+        INP_External = false,
+    })
+    self:EndControlNest()
+
+    -------------------------------------------------------------------------
+    -- Preset input map
+    -------------------------------------------------------------------------
+    PresetInputs = {
+        SequenceMode = InSequence,
+        SequenceOrder = InOrder,
+        RandomSeed = InSeed,
+        StartFrame = InStartFrame,
+        ExitStart = InExitStart,
+        Speed = InSpeed,
+        InDuration = InDuration,
+        InStagger = InStagger,
+        FitIn = InFitIn,
+        InTotal = InInTotal,
+        OutDuration = InOutDuration,
+        OutStagger = InOutStagger,
+        FitOut = InFitOut,
+        OutTotal = InOutTotal,
+        Direction = InDirection,
+        Distance = InDistance,
+        Settle = InSettle,
+        ScaleIn = InScaleIn,
+        ScaleOut = InScaleOut,
+        RotationIn = InRotation,
+        RotationOut = InRotationOut,
+        TrackingIn = InTrackingIn,
+        TrackingOut = InTrackingOut,
+        EaseIn = InEaseIn,
+        EaseOut = InEaseOut,
+        Fade = InFade,
+        Blur = InBlur,
+        BlurAmount = InBlurAmount,
+        MaxBlur = InMaxBlur,
+        MasterIntensity = InMasterIntensity,
+    }
+
+    selectedPreset = 0
+end
+
+-- The output is created before any control.  If one cosmetic control is
+-- rejected by this Fusion build, the tool still has a valid Output, so
+-- Process() keeps running and Media Out receives an image instead of the
+-- "cannot get Parameter for Input" failure.  A broken control is reported in
+-- the console instead of taking the whole tool down.
+function Create()
+    local okIO, errIO = pcall(buildIO)
+    if not okIO then
+        dbg("Create: image I/O failed:", tostring(errIO))
+    end
+    if not OutImage then
+        -- Last resort: without an Output the tool cannot render at all.
+        local okOut, errOut = pcall(makeOutput)
+        if not okOut or not OutImage then
+            dbg("Create: output creation failed:", tostring(errOut))
+        end
+    end
+    dbg("Create: output created")
+
+    local ok, err = pcall(buildControls)
+    if not ok then
+        dbg("Create: control creation failed:", tostring(err))
+        pcall(print, "[Text Animator] Control creation failed: " .. tostring(err))
+    end
+
+    dbg("Create: done",
+        " text=", tostring(InText ~= nil),
+        " font=", tostring(InFont ~= nil),
+        " preset=", tostring(InPreset ~= nil))
+end
+
+-----------------------------------------------------------------------------
+-- NotifyChanged
+-----------------------------------------------------------------------------
+
+local function setVisible(input, visible)
+    if input then
+        pcall(function()
+            input:SetAttrs({ IC_Visible = visible and true or false })
+        end)
+    end
+end
+
+local function applyPreset(index, time)
+    local values = E.presetValues(index)
+    local map = PresetInputs
+    if not map then return end
+    for key, value in pairs(values) do
+        local input = map[key]
+        if input then
+            pcall(function()
+                input:SetSource(Number(value), time or 0)
+            end)
+        end
+    end
+end
+
+function NotifyChanged(inp, param, time)
+    if inp == InFont then
+        local f = param and param.Value
+        if f == nil or tostring(f):len() == 0 then
+            pcall(function() InFont:SetSource(Text("Arial"), time or 0) end)
+        end
+    elseif inp == InFontStyle then
+        local f = param and param.Value
+        if f == nil or tostring(f):len() == 0 then
+            pcall(function() InFontStyle:SetSource(Text("Regular"), time or 0) end)
+        end
+    elseif inp == InPreset then
+        if param then selectedPreset = math.floor(tonumber(param.Value) or 0) end
+    elseif inp == InApplyPreset then
+        local pressed = param and (tonumber(param.Value) or 0) > 0.5
+        if pressed then
+            local index = selectedPreset
+            local ok, v = pcall(function() return InPreset:GetSource(time or 0) end)
+            if ok and v and v.Value ~= nil then
+                index = math.floor(tonumber(v.Value) or index)
+            end
+            applyPreset(index, time)
+            -- Reset the button.  Fusion stores input values in the comp, so a
+            -- button left at 1 would fire again on every comp load and quietly
+            -- overwrite the animation values saved by the user.
+            pcall(function() InApplyPreset:SetSource(Number(0), time or 0) end)
+        end
+    end
+end
+
+--===========================================================================
+-- PART 3 - RENDERING
+--===========================================================================
+
+local TRANSPARENT = { R = 0, G = 0, B = 0, A = 0 }
+
+local function getNum(input, req, default)
+    if not input then return default end
+    local ok, v = pcall(function() return input:GetValue(req) end)
+    if ok and v and v.Value ~= nil then
+        local n = tonumber(v.Value)
+        if n ~= nil then return n end
+    end
+    return default
+end
+
+local function getText(input, req, default)
+    if not input then return default end
+    local ok, v = pcall(function() return input:GetValue(req) end)
+    if ok and v and v.Value ~= nil then return tostring(v.Value) end
+    return default
+end
+
+local function getPoint(input, req, dx, dy)
+    if not input then return dx, dy end
+    local ok, v = pcall(function() return input:GetValue(req) end)
+    if ok and v then
+        return tonumber(v.X) or dx, tonumber(v.Y) or dy
+    end
+    return dx, dy
+end
+
+local function getImage(input, req)
+    if not input then return nil end
+    local ok, v = pcall(function() return input:GetValue(req) end)
+    if ok then return v end
+    return nil
+end
+
+-- Temporary render diagnostics live in PART 0 near the top of this file so
+-- that Create() can use them too.
+
+-- Logs the real pixel dimensions and the data window (DoD) of an image.
+-- A valid image with an empty data window is the classic reason a downstream
+-- node reports "cannot get Parameter for Input".
+local function describeImage(tag, img)
+    if not img then
+        dbg(tag, "nil image")
+        return
+    end
+    local ok, err = pcall(function()
+        local dw = img.DataWindow
+        if not dw then
+            dbg(tag, "size=", tostring(img.Width), "x", tostring(img.Height), "no DataWindow")
+            return
+        end
+        local dwW = dw:Width()
+        local dwH = dw:Height()
+        dbg(tag,
+            "size=", tostring(img.Width), "x", tostring(img.Height),
+            "dod=", tostring(dw.left), ",", tostring(dw.bottom), ",",
+            tostring(dw.right), ",", tostring(dw.top),
+            "dim=", tostring(dwW), "x", tostring(dwH))
+    end)
+    if not ok then
+        dbg(tag, "size=", tostring(img.Width), "x", tostring(img.Height),
+            "DataWindow unreadable:", tostring(err))
+    end
+end
+
+-- Coarse alpha probe used by the diagnostics. Read-only: samples a grid and
+-- reports how many samples are non-transparent, so the log can distinguish
+-- "nothing was drawn" from "the composite lost the layer".
+local function alphaCoverage(img, stepX, stepY)
+    if not img then return 0, 0, 0, 0, 0, 0 end
+    stepX = stepX or 48
+    stepY = stepY or 48
+    local total, hit, maxA = 0, 0, 0
+    local maxR, maxG, maxB = 0, 0, 0
+    local px = Pixel({ R = 0, G = 0, B = 0, A = 0 })
+    for y = 0, img.Height - 1, stepY do
+        for x = 0, img.Width - 1, stepX do
+            total = total + 1
+            local ok = pcall(function() img:GetPixel(x, y, px) end)
+            if ok and px and tonumber(px.A) and px.A > 0.001 then
+                hit = hit + 1
+                if px.A > maxA then
+                    maxA = px.A
+                    maxR = tonumber(px.R) or 0
+                    maxG = tonumber(px.G) or 0
+                    maxB = tonumber(px.B) or 0
+                end
+            end
+        end
+    end
+    return hit, total, maxA, maxR, maxG, maxB
+end
+
+-- Reports whether the image's data window covers the whole frame.  This is
+-- read-only on purpose: the Fuse SDK documents that writing outside the data
+-- window may crash the host, so this build never touches pixels to repair it.
+local function ensureFullDataWindow(img, W, H)
+    if not img then return false, "nil image" end
+    local ok, dw = pcall(function() return img.DataWindow end)
+    if not ok or not dw then return false, "no DataWindow" end
+    local okW, dwW = pcall(function() return dw:Width() end)
+    local okH, dwH = pcall(function() return dw:Height() end)
+    if okW and okH and tonumber(dwW) and tonumber(dwH) then
+        if dwW >= W and dwH >= H then return true, "already full" end
+        return false, "smaller than frame (" .. tostring(dwW) .. "x" .. tostring(dwH) .. ")"
+    end
+    return false, "DataWindow size unreadable"
+end
+
+local function compSize(tool)
+    -- During Process, Fusion exposes the requested image size as globals.
+    -- This is the documented way a generator discovers the comp format.
+    local gw, gh = tonumber(Width), tonumber(Height)
+    if gw and gh and gw > 0 and gh > 0 then
+        return math.max(1, math.floor(gw + 0.5)), math.max(1, math.floor(gh + 0.5))
+    end
+
+    local w, h = 1920, 1080
+    if tool and tool.Comp then
+        local ok, v = pcall(function() return tool.Comp:GetPrefs("Comp.FrameFormat.Width") end)
+        if ok and tonumber(v) and tonumber(v) > 0 then
+            w = math.floor(tonumber(v) + 0.5)
+        end
+        ok, v = pcall(function() return tool.Comp:GetPrefs("Comp.FrameFormat.Height") end)
+        if ok and tonumber(v) and tonumber(v) > 0 then
+            h = math.floor(tonumber(v) + 0.5)
+        end
+    end
+    return math.max(1, w), math.max(1, h)
+end
+
+local function makeImage(doc, w, h, quality)
+    w = math.max(1, math.floor(w + 0.5))
+    h = math.max(1, math.floor(h + 0.5))
+    local attrs = {
+        IMG_Width = w,
+        IMG_Height = h,
+        IMG_XScale = 1.0,
+        IMG_YScale = 1.0,
+        IMAT_OriginalWidth = w,
+        IMAT_OriginalHeight = h,
+        IMG_Depth = 8,
+        IMG_Quality = quality and true or false,
+        IMG_MotionBlurQuality = false,
+        { IMG_Channel = "Red" },
+        { IMG_Channel = "Green" },
+        { IMG_Channel = "Blue" },
+        { IMG_Channel = "Alpha" },
+    }
+    if doc then attrs.IMG_Document = doc end
+    local ok, img = pcall(Image, attrs)
+    if not ok then
+        dbg("Image() threw:", tostring(img))
+        return nil
+    end
+    if not img then
+        dbg("Image() returned nil for", w, "x", h, "doc=", tostring(doc ~= nil))
+    end
+    return img
+end
+
+local function clearImage(img)
+    img:Fill(Pixel(TRANSPARENT))
+end
+
+local function copyImage(img)
+    local ok, out = pcall(function() return img:CopyOf() end)
+    if ok and out then return out end
+    ok, out = pcall(function() return img:Copy() end)
+    if ok and out then return out end
+    return img
+end
+
+local fontsScanned = false
+local function scanFonts()
+    if fontsScanned then return end
+    pcall(function()
+        if FontManager then
+            local list = FontManager:GetFontList()
+            if list == nil or next(list) == nil then
+                FontManager:ScanDir()
+            end
+        end
+    end)
+    fontsScanned = true
+end
+
+local function readMetric(tfm, key, default)
+    local ok, v = pcall(function() return tfm[key] end)
+    if ok and tonumber(v) ~= nil then return tonumber(v) end
+    return default
+end
+
+local function makeMetrics(fontName, fontStyle, sizePx)
+    scanFonts()
+    local candidates = {}
+    if fontName and fontName ~= "" then
+        candidates[#candidates + 1] = { fontName, fontStyle or "Regular" }
+        candidates[#candidates + 1] = { fontName, "Regular" }
+    end
+    candidates[#candidates + 1] = { "Arial", "Regular" }
+    candidates[#candidates + 1] = { "Helvetica", "Regular" }
+    candidates[#candidates + 1] = { "Verdana", "Regular" }
+
+    local tfm = nil
+    local usedName, usedStyle
+    for i = 1, #candidates do
+        local name, style = candidates[i][1], candidates[i][2]
+        local ok, font = pcall(function() return TextStyleFont(name, style) end)
+        if ok and font then
+            local ok2, metrics = pcall(function() return TextStyleFontMetrics(font) end)
+            if ok2 and metrics then
+                tfm = metrics
+                usedName, usedStyle = name, style
+                break
+            end
+        end
+    end
+    if not tfm then return nil end
+
+    local tfmScale = readMetric(tfm, "Scale", 1)
+    if tfmScale == 0 then tfmScale = 1 end
+
+    local ascent = math.abs(readMetric(tfm, "TextAscent", 0.08)) * 10 * sizePx
+    local descent = math.abs(readMetric(tfm, "TextDescent", 0.02)) * 10 * sizePx
+    local leading = math.abs(readMetric(tfm, "TextExternalLeading", 0)) * 10 * sizePx
+    if ascent + descent < 1 then
+        ascent, descent, leading = sizePx * 0.8, sizePx * 0.2, 0
+    end
+
+    local cache = {}
+    local function advance(cp)
+        local v = cache[cp]
+        if v ~= nil then return v end
+        local ok, r = pcall(function() return tfm:CharacterWidth(cp) end)
+        v = (ok and tonumber(r)) or 0
+        if v < 0 then v = 0 end
+        v = v * 10 * sizePx
+        cache[cp] = v
+        return v
+    end
+    local function kern(a, b)
+        local ok, r = pcall(function() return tfm:CharacterKerning(a, b) end)
+        local v = (ok and tonumber(r)) or 0
+        return v * 10 * sizePx
+    end
+
+    return {
+        advance = advance,
+        kern = kern,
+        ascentPx = ascent,
+        descentPx = descent,
+        lineGapPx = leading,
+        tfm = tfm,
+        tfmScale = tfmScale,
+        fontName = usedName,
+        fontStyle = usedStyle,
+    }
+end
+
+local function rotPoint(x, y, degrees)
+    if degrees == 0 then return x, y end
+    local r = math.rad(degrees)
+    local c, s = math.cos(r), math.sin(r)
+    return x * c - y * s, x * s + y * c
+end
+
+local reportedGlyphError = false
+local reportedGlyphNil = false
+
+-- Splits a pixel coordinate into a whole-pixel cell origin and the remaining
+-- sub-pixel offset.
+--
+-- A glyph cell is an integer-sized image, so it can only be composited at a
+-- whole-pixel origin.  The old code rounded the target position to the nearest
+-- pixel and drew the glyph at the cell centre, which discarded the remainder.
+-- At the end of an eased move the per-frame displacement falls below one
+-- pixel, so the glyph alternated between moving 1 px and 0 px and the motion
+-- looked choppy.  Keeping the remainder and drawing the glyph at that offset
+-- inside the cell preserves the exact float position, and the shape
+-- rasteriser anti-aliases it.
+function E.cellSplit(v)
+    v = tonumber(v) or 0
+    local i = math.floor(v)
+    local frac = v - i
+    if not (frac >= 0 and frac < 1) then frac = 0 end
+    return i, frac
+end
+
+-- Creates a transformed glyph shape in a coordinate space where both axes are
+-- normalised by coordW (Fusion's Shape convention).
+--
+-- The Fuse manual's text example scales by 1/tfm.Scale then by `size`, but its
+-- `size` is *normalised* (about 0.1), not pixels.  Our Size control is in
+-- pixels, so the equivalent normalised size is fontPx / coordW:
+--
+--     em = (fontPx * scale / coordW) / tfmScale
+--
+-- Dividing by coordW is required.  1.0.6 briefly removed it on the assumption
+-- that the manual used pixels; the GUI showed solid squares during the
+-- animation and a completely white frame when settled, i.e. glyphs covering
+-- the frame because they were ~1920x too large.  1.0.9 restores the division.
+local function glyphShape(cp, fontPx, scale, coordW, posX, posY, rotationDeg, tfm, tfmScale)
+    local ok, sh = pcall(function() return tfm:GetCharacterShape(cp, false) end)
+    if not ok then
+        if not reportedGlyphError then
+            reportedGlyphError = true
+            dbg("render: GetCharacterShape failed for cp", tostring(cp), ":", tostring(sh))
+        end
+        return nil
+    end
+    if not sh then
+        if not reportedGlyphNil then
+            reportedGlyphNil = true
+            dbg("render: GetCharacterShape returned nil for cp", tostring(cp))
+        end
+        return nil
+    end
+    if tfmScale == 0 then tfmScale = 1 end
+    local mat = Matrix4()
+    local em = (fontPx * scale / coordW) / tfmScale
+    mat:Scale(em, em, 1)
+    if rotationDeg ~= 0 then
+        local pivot = 0.35 * fontPx * scale / coordW
+        mat:Move(0, -pivot, 0)
+        mat:RotZ(rotationDeg)
+        mat:Move(0, pivot, 0)
+    end
+    mat:Move(posX / coordW, posY / coordW, 0)
+    return sh:TransformOfShape(mat)
+end
+
+local function makeOutline(sh, thicknessPx, coordW)
+    if thicknessPx <= 0 then return nil end
+    local ok, out = pcall(function()
+        return sh:OutlineOfShape(thicknessPx / coordW, "OLT_Solid", "OJT_Bevel", 8, "SWM_Normal", 8)
+    end)
+    if ok then return out end
+    return nil
+end
+
+local function drawShape(img, sh, r, g, b, a, sampling, copyMode)
+    if not sh then return false end
+    a = E.clamp(tonumber(a) or 0, 0, 1)
+    -- Fusion images are premultiplied: RGB may never exceed alpha.  The shape
+    -- rasteriser writes the colour channels through unchanged, which is why a
+    -- fade only changed alpha while RGB stayed at full white - the layer was
+    -- then added on top and every letter popped in at full brightness.  Fade
+    -- must be visible, so premultiply the colour we hand to the rasteriser.
+    -- This is also what an alpha-aware Over expects, and it keeps the fade
+    -- working even if the host only accepts the additive Merge fallback.
+    local ic = ImageChannel(img, sampling)
+    local fs = FillStyle()
+    ic:SetStyleFill(fs)
+    ic:ShapeFill(sh)
+    local cs = ChannelStyle()
+    cs.Color = Pixel({ R = r * a, G = g * a, B = b * a, A = a })
+    ic:PutToImage(copyMode or "CM_Merge", cs)
+    return true
+end
+
+local function blurImage(img, px, width)
+    if px <= 0.01 or width <= 0 then return img end
+    local opts = {
+        BLUR_Type = "Gaussian",
+        BLUR_Red = true,
+        BLUR_Green = true,
+        BLUR_Blue = true,
+        BLUR_Alpha = true,
+        BLUR_XSize = px / width,
+        BLUR_YSize = px / width,
+        BLUR_Blend = 1.0,
+        -- The manual defines BLUR_Normalize as "1.0 - glow".  Zero therefore
+        -- means full Glow: the blurred image is added back on top, inflating
+        -- alpha (observed maxA 14.9 to 3752 instead of <= 1) and making the
+        -- letters look very thick during the entrance.  1.0 is a plain blur.
+        BLUR_Normalize = 1.0,
+        BLUR_Passes = 0.0,
+    }
+    local ok, out = pcall(function()
+        local dest = Image({ IMG_Like = img })
+        local res = img:Blur(dest, opts)
+        return res or dest
+    end)
+    if ok and out then return out end
+    ok, out = pcall(function() return img:Blur(nil, opts) end)
+    if ok and out then return out end
+    ok, out = pcall(function() return img:Blur(img, opts) end)
+    if ok and out then return out end
+    return img
+end
+
+--===========================================================================
+-- PART 4 - PROCESS
+--===========================================================================
+
+local warnedFont = false
+
+local function readParams(req)
+    local px, py = getPoint(InPosition, req, 0.5, 0.5)
+    return {
+        mode = getNum(InAnimMode, req, 0),
+        sequenceMode = getNum(InSequence, req, 0),
+        order = getNum(InOrder, req, 0),
+        seed = getNum(InSeed, req, 12345),
+        startFrame = getNum(InStartFrame, req, 0),
+        exitStart = getNum(InExitStart, req, 72),
+        speed = getNum(InSpeed, req, 1),
+        inDuration = getNum(InDuration, req, 12),
+        inStagger = getNum(InStagger, req, 2),
+        outDuration = getNum(InOutDuration, req, 12),
+        outStagger = getNum(InOutStagger, req, 2),
+        inTotal = getNum(InInTotal, req, 60),
+        outTotal = getNum(InOutTotal, req, 60),
+        fitIn = getNum(InFitIn, req, 0),
+        fitOut = getNum(InFitOut, req, 0),
+        direction = getNum(InDirection, req, 1),
+        distance = getNum(InDistance, req, 40),
+        settle = getNum(InSettle, req, 1),
+        scaleIn = getNum(InScaleIn, req, 100) / 100,
+        scaleOut = getNum(InScaleOut, req, 100) / 100,
+        rotationIn = getNum(InRotation, req, 0),
+        rotationOut = getNum(InRotationOut, req, 0),
+        trackingIn = getNum(InTrackingIn, req, 0),
+        trackingOut = getNum(InTrackingOut, req, 0),
+        intensity = getNum(InMasterIntensity, req, 1),
+        easingIn = getNum(InEaseIn, req, E.EASE_DEFAULT),
+        easingOut = getNum(InEaseOut, req, E.EASE_DEFAULT_OUT),
+        elasticCycles = getNum(InElasticCycles, req, E.ELASTIC_CYCLES),
+        elasticDamping = getNum(InElasticDamping, req, E.ELASTIC_DAMPING),
+        fade = getNum(InFade, req, 1),
+        blur = getNum(InBlur, req, 1),
+        blurAmount = getNum(InBlurAmount, req, 12),
+        maxBlur = getNum(InMaxBlur, req, 120),
+        size = getNum(InSize, req, 96),
+        tracking = getNum(InTracking, req, 0),
+        lineSpacing = getNum(InLineSpacing, req, 1),
+        align = getNum(InAlign, req, 1),
+        valign = getNum(InVAlign, req, 1),
+        posX = px,
+        posY = py,
+        opacity = getNum(InOpacity, req, 1),
+        masterScale = getNum(InMasterScale, req, 1),
+        masterRotation = getNum(InMasterRotation, req, 0),
+        textR = getNum(InTextR, req, 1),
+        textG = getNum(InTextG, req, 1),
+        textB = getNum(InTextB, req, 1),
+        textA = getNum(InTextA, req, 1),
+        outline = getNum(InOutline, req, 0),
+        outlineThickness = getNum(InOutlineThickness, req, 2),
+        outlineR = getNum(InOutlineR, req, 0),
+        outlineG = getNum(InOutlineG, req, 0),
+        outlineB = getNum(InOutlineB, req, 0),
+        outlineA = getNum(InOutlineA, req, 1),
+        testFrame = getNum(InTestFrame, req, 0) >= 0.5,
+    }
+end
+
+local function isQuick(req)
+    local ok, q = pcall(function() return req:IsQuick() end)
+    if ok then return q and true or false end
+    return false
+end
+
+local function emptyOutput(req, tool, bg, W, H, quality)
+    if bg then
+        dbg("emptyOutput: passing background through", W, "x", H)
+        OutImage:Set(req, copyImage(bg))
+        return
+    end
+    local out = makeImage(tool and tool.Comp, W, H, quality)
+    if not out then
+        error("Image() returned nil for the empty output")
+    end
+    clearImage(out)
+    local full, why = ensureFullDataWindow(out, W, H)
+    dbg("emptyOutput: data window", tostring(full), "(" .. tostring(why) .. ")")
+    dbg("emptyOutput: transparent image set", W, "x", H)
+    OutImage:Set(req, out)
+end
+
+-- The final composite goes through the host's FFI image binding, whose
+-- attribute mapping differs between builds.  The manual states that
+-- MO_ApplyMode = "Merge" (and an empty table) performs an *additive* merge:
+-- the foreground is added over the background and the alpha falloff is lost.
+-- That is what made every fade pop in at full brightness.  "Normal" is the
+-- alpha-aware Over.  It is tried first, with the documented alternatives as
+-- logged fallbacks.  On Resolve 21.0.4 {"Normal", "Over"} once raised
+--   bad argument #3 to 'func' (cannot convert 'nil' to 'int')
+-- so "Normal" alone is attempted before any operator variant.
+local function compositeLayer(out, layer)
+    local strategies = {
+        {
+            name = "Normal",
+            run = function()
+                out:Merge(layer, { MO_ApplyMode = "Normal" })
+            end,
+        },
+        {
+            name = "Normal+Over",
+            run = function()
+                out:Merge(layer, { MO_ApplyMode = "Normal", MO_ApplyOperator = "Over" })
+            end,
+        },
+        {
+            name = "Merge",
+            run = function()
+                out:Merge(layer, { MO_ApplyMode = "Merge" })
+            end,
+        },
+        {
+            name = "Merge+Over",
+            run = function()
+                out:Merge(layer, { MO_ApplyMode = "Merge", MO_ApplyOperator = "Over" })
+            end,
+        },
+        {
+            name = "empty (additive)",
+            run = function()
+                out:Merge(layer, {})
+            end,
+        },
+        {
+            name = "OMerge",
+            run = function()
+                out:OMerge(layer, 0, 0)
+            end,
+        },
+        {
+            name = "BlendOf",
+            run = function()
+                local merged = out:BlendOf(layer, 1.0)
+                if merged then out = merged end
+            end,
+        },
+        {
+            name = "MergeOf",
+            run = function()
+                local merged = out:MergeOf(layer, { MO_ApplyMode = "Merge" })
+                if merged then out = merged end
+            end,
+        },
+    }
+    for _, strategy in ipairs(strategies) do
+        local ok, err = pcall(strategy.run)
+        if ok then
+            dbg("render: layer composite ok via", strategy.name)
+            return out
+        end
+        dbg("render: layer composite failed via", strategy.name, ":", tostring(err))
+    end
+    dbg("render: every layer composite strategy failed")
+    return out
+end
+
+-- Animated glyphs are drawn into small cells and then placed onto the text
+-- layer.  OMerge is additive: where two cells overlap, their RGB and alpha add,
+-- which looks like thick, over-bright letters with black patches when alpha
+-- exceeds 1.  Merge is alpha-aware, but its position attributes are NOT pixel
+-- offsets like OMerge's: MO_XOffset/MO_YOffset are the foreground centre in
+-- normalised image coordinates (0,0 bottom left; 0.5,0.5 centre; 1,1 top
+-- right).  Passing pixel values put every cell far outside the frame, so the
+-- animation became invisible and letters only appeared when they settled into
+-- the static shape.  Convert the cell's pixel bounds to a normalised centre.
+local loggedCellStrategies = {}
+
+local function mergeCellAt(layer, cell, x, y)
+    local W = tonumber(layer and layer.Width) or 1
+    local H = tonumber(layer and layer.Height) or 1
+    local cw = tonumber(cell and cell.Width) or 0
+    local ch = tonumber(cell and cell.Height) or 0
+    local cx = (x + cw / 2) / W
+    local cy = (y + ch / 2) / H
+
+    local attempts = {
+        {
+            name = "Normal+centre",
+            run = function()
+                layer:Merge(cell, {
+                    MO_ApplyMode = "Normal",
+                    MO_XOffset = cx,
+                    MO_YOffset = cy,
+                    MO_XAxis = 0.5,
+                    MO_YAxis = 0.5,
+                })
+            end,
+        },
+        {
+            name = "Normal+Over+centre",
+            run = function()
+                layer:Merge(cell, {
+                    MO_ApplyMode = "Normal",
+                    MO_ApplyOperator = "Over",
+                    MO_XOffset = cx,
+                    MO_YOffset = cy,
+                    MO_XAxis = 0.5,
+                    MO_YAxis = 0.5,
+                })
+            end,
+        },
+        {
+            name = "Merge+centre",
+            run = function()
+                layer:Merge(cell, {
+                    MO_ApplyMode = "Merge",
+                    MO_XOffset = cx,
+                    MO_YOffset = cy,
+                    MO_XAxis = 0.5,
+                    MO_YAxis = 0.5,
+                })
+            end,
+        },
+        {
+            name = "OMerge",
+            run = function()
+                layer:OMerge(cell, x, y)
+            end,
+        },
+    }
+    for _, a in ipairs(attempts) do
+        local ok, err = pcall(a.run)
+        if ok then
+            if not loggedCellStrategies[a.name] then
+                loggedCellStrategies[a.name] = true
+                dbg("render: animated cell composite via", a.name,
+                    string.format("centre= %.4f,%.4f (%.1f,%.1f px)", cx, cy, x, y))
+            end
+            return true
+        end
+        if not loggedCellStrategies[a.name] then
+            loggedCellStrategies[a.name] = true
+            dbg("render: animated cell composite failed via", a.name, ":", tostring(err))
+        end
+    end
+    return false
+end
+
+local function renderText(req, tool)
+    local p = E.sanitizeParams(readParams(req))
+    local bg = getImage(InBackground, req)
+    dbg("render: frame=", tostring(req and req.Time),
+        "bg=", bg and (tostring(bg.Width) .. "x" .. tostring(bg.Height)) or "nil")
+    local W, H
+    if bg and tonumber(bg.Width) and tonumber(bg.Height)
+        and tonumber(bg.Width) > 0 and tonumber(bg.Height) > 0 then
+        W = math.floor(tonumber(bg.Width) + 0.5)
+        H = math.floor(tonumber(bg.Height) + 0.5)
+    else
+        W, H = compSize(tool)
+        bg = nil
+    end
+    local quick = isQuick(req)
+    local quality = not quick
+    local sampling = quick and 1 or 32
+    dbg("render: size=", W, "x", H, "quick=", tostring(quick))
+
+    -- Diagnostic bypass: proves that Process() runs and that this Fuse can
+    -- deliver a full-frame image, without touching any text or shape code.
+    if p.testFrame then
+        local testOut = makeImage(tool and tool.Comp, W, H, quality)
+        if not testOut then
+            error("Image() returned nil for the diagnostic frame")
+        end
+        testOut:Fill(Pixel({ R = 1, G = 0, B = 1, A = 1 }))
+        describeImage("render: diagnostic frame", testOut)
+        OutImage:Set(req, testOut)
+        dbg("render: diagnostic solid frame set")
+        return
+    end
+
+    local text = getText(InText, req, "")
+    if text == "" then
+        dbg("render: empty text")
+        emptyOutput(req, tool, bg, W, H, quality)
+        return
+    end
+
+    local fontSize = p.size * p.masterScale
+    local metrics = makeMetrics(getText(InFont, req, "Arial"), getText(InFontStyle, req, "Regular"), fontSize)
+    if not metrics then
+        if not warnedFont then
+            warnedFont = true
+            print("[Text Animator] Could not load a font. Please choose an installed font in the Text section.")
+        end
+        dbg("render: no font metrics")
+        emptyOutput(req, tool, bg, W, H, quality)
+        return
+    end
+    dbg("render: font=", metrics.fontName, metrics.fontStyle,
+        "size=", fontSize,
+        "ascent=", metrics.ascentPx, "descent=", metrics.descentPx,
+        "scale=", metrics.tfmScale)
+
+    local layout = E.layout(text, {
+        sizePx = fontSize,
+        trackingPx = p.tracking * p.masterScale,
+        lineSpacing = p.lineSpacing,
+        align = p.align,
+        valign = p.valign,
+    }, metrics)
+
+    if #layout.glyphs == 0 then
+        dbg("render: layout produced no glyphs")
+        emptyOutput(req, tool, bg, W, H, quality)
+        return
+    end
+
+    local segments = E.buildSegments(layout, p.sequenceMode)
+    if #segments == 0 then
+        dbg("render: no segments")
+        emptyOutput(req, tool, bg, W, H, quality)
+        return
+    end
+    dbg("render: glyphs=", #layout.glyphs, "segments=", #segments,
+        "sequence=", p.sequenceMode, "mode=", p.mode)
+    local gFirst = layout.glyphs[1]
+    local gLast = layout.glyphs[#layout.glyphs]
+    dbg("render: glyph layout first=",
+        gFirst and string.format("%.1f,%.1f", gFirst.xPx, gFirst.baselinePx) or "nil",
+        "last=", gLast and string.format("%.1f,%.1f", gLast.xPx, gLast.baselinePx) or "nil")
+
+    local ranks = E.computeRanks(#segments, p.order, p.seed)
+    local timing = E.computeTiming(p, #segments)
+    local frame = math.floor((tonumber(req.Time) or 0) + 0.5)
+    local t = (frame - p.startFrame) * p.speed
+    local states = {}
+    for i = 1, #segments do
+        states[i] = E.evaluateSegment(p, t, ranks[i], timing)
+    end
+
+    local anchorX = p.posX * W
+    local anchorY = p.posY * H
+    local rot = p.masterRotation
+    dbg("render: anchor=", string.format("%.1f,%.1f", anchorX, anchorY),
+        "rotation=", rot, "masterScale=", p.masterScale)
+
+    local out
+    if bg then
+        out = copyImage(bg)
+    else
+        out = makeImage(tool and tool.Comp, W, H, quality)
+        if not out then
+            error("Image() returned nil for the output image")
+        end
+        clearImage(out)
+        local full, why = ensureFullDataWindow(out, W, H)
+        dbg("render: out data window", tostring(full), "(" .. tostring(why) .. ")")
+    end
+    describeImage("render: out before text", out)
+
+    -- The text is built in a transparent full-frame layer so that it can be
+    -- composited over the background with a proper Over, rather than an
+    -- additive merge.
+    local layer = makeImage(tool and tool.Comp, W, H, quality)
+    if not layer then
+        error("Image() returned nil for the text layer")
+    end
+    clearImage(layer)
+    local layerFull, layerWhy = ensureFullDataWindow(layer, W, H)
+    dbg("render: layer data window", tostring(layerFull), "(" .. tostring(layerWhy) .. ")")
+    describeImage("render: layer before text", layer)
+
+    local textAlpha = p.textA * p.opacity
+    local staticCount = 0
+    local cellCount = 0
+
+    -- Fast path: all settled glyphs are drawn in one shape.
+    local fillShape = Shape()
+    local outlineShape = Shape()
+    local hasStatic = false
+    for i = 1, #layout.glyphs do
+        local g = layout.glyphs[i]
+        if g.segment and not g.isSpace then
+            local st = states[g.segment]
+            if not st.animating and E.isFinalState(st) then
+                local rx, ry = rotPoint(g.xPx + E.trackShift(g, st.tracking or 0),
+                    g.baselinePx, rot)
+                local sh = glyphShape(g.cp, fontSize, 1, W,
+                    anchorX + rx, anchorY + ry, rot, metrics.tfm, metrics.tfmScale)
+                if sh then
+                    fillShape:AddShape(sh)
+                    if p.outline and p.outlineThickness > 0 then
+                        local o = makeOutline(sh, p.outlineThickness * p.masterScale, W)
+                        if o then outlineShape:AddShape(o) end
+                    end
+                    hasStatic = true
+                    staticCount = staticCount + 1
+                end
+            end
+        end
+    end
+
+    if hasStatic and (textAlpha > 0
+        or (p.outline and p.outlineThickness > 0 and p.outlineA * p.opacity > 0)) then
+        if p.outline and p.outlineThickness > 0 and p.outlineA * p.opacity > 0 then
+            drawShape(layer, outlineShape, p.outlineR, p.outlineG, p.outlineB,
+                p.outlineA * p.opacity, sampling, "CM_Merge")
+        end
+        if textAlpha > 0 then
+            drawShape(layer, fillShape, p.textR, p.textG, p.textB,
+                textAlpha, sampling, "CM_Merge")
+        end
+    end
+    dbg("render: static glyphs=", staticCount, "textAlpha=", textAlpha,
+        "outline=", tostring(p.outline and p.outlineThickness > 0))
+
+    -- Animated segments are rendered into small cells, blurred, and added
+    -- into the text layer.  Cells keep per-segment blur affordable.
+    if p.opacity > 0 and (textAlpha > 0
+        or (p.outline and p.outlineThickness > 0 and p.outlineA > 0)) then
+        for si = 1, #segments do
+            local st = states[si]
+            if E.needsCell(st) then
+                local seg = segments[si]
+                local blurPx = math.min(st.blur, p.maxBlur)
+                local margin = math.ceil(blurPx * 2.5 + fontSize * 0.12) + 4
+                if margin > 600 then margin = 600 end
+                local scaleMax = math.max(1, st.scale)
+                -- Master rotation and the segment's own spin both need the
+                -- larger square cell so a rotated glyph cannot be clipped.
+                local cellRotation = rot + (st.rotation or 0)
+                local rotatedCell = (cellRotation ~= 0)
+
+                for gi = 1, #seg.glyphs do
+                    local g = seg.glyphs[gi]
+                    if not g.isSpace then
+                        local cellW = math.max(g.advancePx * scaleMax, fontSize * 0.7 * scaleMax)
+                            + margin * 2
+                        local cellH = (metrics.ascentPx + metrics.descentPx) * scaleMax + margin * 2
+                        if rotatedCell then
+                            -- The square must also contain the glyph when it
+                            -- turns about its pivot, which sits slightly off
+                            -- the cell centre.  The extra 0.7 em covers that
+                            -- offset at any angle.
+                            local diag = math.ceil(math.sqrt(cellW * cellW + cellH * cellH)
+                                + fontSize * scaleMax * 0.7) + 2
+                            cellW, cellH = diag, diag
+                        end
+                        cellW = math.max(1, math.ceil(cellW))
+                        cellH = math.max(1, math.ceil(cellH))
+                        local rx, ry = rotPoint(g.xPx + E.trackShift(g, st.tracking or 0),
+                            g.baselinePx, rot)
+                        local centerX = anchorX + rx + st.dx
+                        local baselineY = anchorY + ry + st.dy
+                        local fromBottom
+                        if rotatedCell then
+                            fromBottom = cellH / 2
+                        else
+                            fromBottom = margin + metrics.descentPx * scaleMax
+                        end
+                        -- Whole-pixel origin plus the sub-pixel remainder.
+                        -- The remainder is drawn into the cell, so the glyph
+                        -- lands on its exact float position and eased motion
+                        -- stays smooth instead of stepping once per pixel.
+                        local left, subX = E.cellSplit(centerX - cellW / 2)
+                        local bottom, subY = E.cellSplit(baselineY - fromBottom)
+
+                        if not (left + cellW <= 0 or left >= W
+                            or bottom + cellH <= 0 or bottom >= H) then
+                            local cell = makeImage(tool and tool.Comp, cellW, cellH, quality)
+                            if not cell then
+                                error("Image() returned nil for an animated glyph cell")
+                            end
+                            clearImage(cell)
+
+                            local sh = glyphShape(g.cp, fontSize, st.scale, cellW,
+                                cellW / 2 + subX, fromBottom + subY, cellRotation,
+                                metrics.tfm, metrics.tfmScale)
+                            if sh then
+                                local drew = false
+                                if p.outline and p.outlineThickness > 0 then
+                                    local o = makeOutline(sh, p.outlineThickness * p.masterScale, cellW)
+                                    if o then
+                                        drew = drawShape(cell, o, p.outlineR, p.outlineG, p.outlineB,
+                                            p.outlineA * p.opacity * st.alpha, sampling, "CM_Copy") or drew
+                                    end
+                                end
+                                if drawShape(cell, sh, p.textR, p.textG, p.textB,
+                                        textAlpha * st.alpha, sampling,
+                                        (p.outline and p.outlineThickness > 0) and "CM_Merge" or "CM_Copy") or drew then
+                                    local blurred = blurImage(cell, blurPx, cellW)
+                                    if cellCount == 0 then
+                                        dbg("render: first cell",
+                                            string.format("bounds= %d,%d %dx%d sub= %.3f,%.3f alpha= %.3f dx= %.2f dy= %.2f scale= %.3f rot= %.2f track= %.2f blur= %.2f",
+                                                left, bottom, cellW, cellH, subX, subY,
+                                                textAlpha * st.alpha, st.dx, st.dy, st.scale,
+                                                st.rotation or 0, st.tracking or 0, blurPx))
+                                    end
+                                    mergeCellAt(layer, blurred, left, bottom)
+                                    cellCount = cellCount + 1
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    dbg("render: animated cells=", cellCount)
+    local hit, total, maxA, maxR, maxG, maxB = alphaCoverage(layer)
+    dbg("render: layer coverage=", hit, "/", total, "maxA=", maxA,
+        string.format("RGB= %.3f,%.3f,%.3f", maxR, maxG, maxB))
+    dbg("render: compositing text layer")
+    out = compositeLayer(out, layer)
+    describeImage("render: out after merge", out)
+    local ohit, ototal, omax, omaxR, omaxG, omaxB = alphaCoverage(out)
+    dbg("render: out coverage=", ohit, "/", ototal, "maxA=", omax,
+        string.format("RGB= %.3f,%.3f,%.3f", omaxR, omaxG, omaxB))
+    OutImage:Set(req, out)
+    dbg("render: output set")
+end
+
+local reportedTraceback = false
+
+function Process(req)
+    dbg("Process enter: time=", tostring(req and req.Time),
+        "comp=", tostring(self ~= nil and self.Comp ~= nil),
+        "out=", tostring(OutImage ~= nil),
+        "globals=", tostring(Width), "x", tostring(Height))
+
+    if not OutImage then
+        dbg("Process: OutImage is nil - Create() did not run")
+        return
+    end
+
+    local ok, err = pcall(renderText, req, self)
+    if ok then
+        dbg("Process: done")
+        return
+    end
+
+    dbg("Process: render error:", tostring(err))
+    if not reportedTraceback then
+        reportedTraceback = true
+        pcall(function() dbg("Process: traceback:", debug.traceback("", 2)) end)
+    end
+
+    local tool = self or {}
+    local bg = nil
+    pcall(function() bg = getImage(InBackground, req) end)
+    local W, H = compSize(tool)
+    if bg and tonumber(bg.Width) and tonumber(bg.Height) then
+        W = math.floor(tonumber(bg.Width) + 0.5)
+        H = math.floor(tonumber(bg.Height) + 0.5)
+    end
+
+    local ok2, err2 = pcall(emptyOutput, req, tool, bg, W, H, not isQuick(req))
+    if ok2 then
+        dbg("Process: fallback empty output set")
+        return
+    end
+    dbg("Process: fallback error:", tostring(err2))
+
+    -- Last resort: the smallest documented image, so the downstream node at
+    -- least receives a valid parameter instead of a failed render.
+    local ok3, err3 = pcall(function()
+        local minimal = Image({ IMG_Width = W, IMG_Height = H })
+        if minimal then
+            minimal:Fill(Pixel({ R = 0, G = 0, B = 0, A = 0 }))
+        end
+        OutImage:Set(req, minimal)
+    end)
+    if ok3 then
+        dbg("Process: minimal image set")
+    else
+        dbg("Process: last resort error:", tostring(err3))
+    end
+end
+
+dbg("fuse loaded: Text Animator " .. E.VERSION .. " (REG_Version 121)")
